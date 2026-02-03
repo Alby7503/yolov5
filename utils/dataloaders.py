@@ -768,14 +768,13 @@ class LoadImagesAndLabels(Dataset):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
-        if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
+        if mosaic := self.mosaic and random.random() < hyp["mosaic"] and False:
             # Load mosaic
-            img, labels = self.load_mosaic(index)
+            img1, labels = self.load_mosaic(index)
             shapes = None
-
             # MixUp augmentation
             if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+                img1, labels = mixup(img1, labels, *self.load_mosaic(random.choice(self.indices)))
 
         else:
             # Load image
@@ -791,8 +790,10 @@ class LoadImagesAndLabels(Dataset):
             shapes = (h01, w01), ((h1 / h01, w1 / w01), pad)  # for COCO mAP rescaling
             img2, _, _ = letterbox(img2, shape, auto=False, scaleup=self.augment)
             shapes = (h01, w01), ((h1 / h01, w1 / w01), pad)  # for COCO mAP rescaling
-
-            labels = self.labels[index+1].copy()
+            if len(self.labels) >= index - 1: 
+                labels = self.labels[index].copy()
+            else:
+                labels = self.labels[index+1].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w1, ratio[1] * h1, padw=pad[0], padh=pad[1])
 
