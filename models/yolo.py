@@ -476,7 +476,7 @@ if __name__ == "__main__":
 
     # Create model
     im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
-    model = Model(opt.cfg).to(device)
+    model = Model(opt.cfg,ch=6,nc=80).to(device)
 
     # Options
     if opt.line_profile:  # profile layer by layer
