@@ -840,16 +840,12 @@ class LoadImagesAndLabels(Dataset):
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        img1 = img1.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img1 = np.ascontiguousarray(img1)
-        img2 = img2.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img2 = np.ascontiguousarray(img2)
-
-        img1 = torch.from_numpy(img1)
-        img2 = torch.from_numpy(img2)
+        img_stacked = np.concatenate((img2, img1))
+        img = img_stacked.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
 
 
-        return torch.cat((img2,img1)), labels_out, self.im_files[index], shapes
+        return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
     def load_image(self, i):
         """Loads an image by index, returning the image, its original dimensions, and resized dimensions.
