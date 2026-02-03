@@ -779,18 +779,24 @@ class LoadImagesAndLabels(Dataset):
 
         else:
             # Load image
-            img, (h0, w0), (h, w) = self.load_image(index)
+            img1, (h01, w01), (h1, w1) = self.load_image(index)
+            if index>0:
+                img2, _, _ = self.load_image(index-1)
+            else:
+                img2, _, _ = self.load_image(index)
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            img1, ratio, pad = letterbox(img1, shape, auto=False, scaleup=self.augment)
+            shapes = (h01, w01), ((h1 / h01, w1 / w01), pad)  # for COCO mAP rescaling
+            img2, _, _ = letterbox(img2, shape, auto=False, scaleup=self.augment)
+            shapes = (h01, w01), ((h1 / h01, w1 / w01), pad)  # for COCO mAP rescaling
 
-            labels = self.labels[index].copy()
+            labels = self.labels[index+1].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w1, ratio[1] * h1, padw=pad[0], padh=pad[1])
 
-            if self.augment:
+            '''if self.augment:
                 img, labels = random_perspective(
                     img,
                     labels,
@@ -799,13 +805,13 @@ class LoadImagesAndLabels(Dataset):
                     scale=hyp["scale"],
                     shear=hyp["shear"],
                     perspective=hyp["perspective"],
-                )
+                )'''
 
         nl = len(labels)  # number of labels
         if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img1.shape[1], h=img1.shape[0], clip=True, eps=1e-3)
 
-        if self.augment:
+        '''if self.augment:
             # Albumentations
             img, labels = self.albumentations(img, labels)
             nl = len(labels)  # update after albumentations
@@ -827,17 +833,23 @@ class LoadImagesAndLabels(Dataset):
 
             # Cutouts
             # labels = cutout(img, labels, p=0.5)
-            # nl = len(labels)  # update after cutout
+            # nl = len(labels)  # update after cutout'''
 
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
+        img1 = img1.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img1 = np.ascontiguousarray(img1)
+        img2 = img2.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img2 = np.ascontiguousarray(img2)
 
-        return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+        img1 = torch.from_numpy(img1)
+        img2 = torch.from_numpy(img2)
+
+
+        return torch.cat((img2,img1)), labels_out, self.im_files[index], shapes
 
     def load_image(self, i):
         """Loads an image by index, returning the image, its original dimensions, and resized dimensions.
