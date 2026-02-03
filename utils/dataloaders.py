@@ -841,7 +841,7 @@ class LoadImagesAndLabels(Dataset):
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        img_stacked = np.concatenate((img2, img1))
+        img_stacked = np.concatenate((img2, img1), axis=2)
         img = img_stacked.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
