@@ -41,6 +41,7 @@ from models.common import (
     Conv,
     CrossConv,
     DetectMultiBackend,
+    DFP,    #La nostra implementazione di DFP
     DWConv,
     DWConvTranspose2d,
     Expand,
@@ -239,6 +240,23 @@ class DetectionModel(BaseModel):
             LOGGER.info(f"Overriding model.yaml anchors with anchors={anchors}")
             self.yaml["anchors"] = round(anchors)  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        
+        # --- STREAMYOLO DFP INIT START ---
+        # Define which layers are the Backbone outputs (P3, P4, P5).
+        # In standard YOLOv5s, these are layers 4, 6, and 9.
+        self.dfp_indices = [4, 6, 9] 
+        
+        # Create a DFP module for each scale
+        # We try to grab channels dynamically. If that fails, we fallback to hardcoded v5s numbers (128, 256, 512).
+        self.dfp_modules = nn.ModuleList([
+            DFP(self.model[4].cv3.conv.out_channels if hasattr(self.model[4], 'cv3') else 128),
+            DFP(self.model[6].cv3.conv.out_channels if hasattr(self.model[6], 'cv3') else 256),
+            DFP(self.model[9].cv2.conv.out_channels if hasattr(self.model[9], 'cv2') else 512)
+        ])
+        # Buffer to hold features from the previous frame
+        self.prev_features = [None, None, None]
+        # --- STREAMYOLO DFP INIT END ---
+        
         self.names = [str(i) for i in range(self.yaml["nc"])]  # default names
         self.inplace = self.yaml.get("inplace", True)
 

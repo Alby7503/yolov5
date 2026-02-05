@@ -558,7 +558,7 @@ class LoadImagesAndLabels(Dataset):
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic = False #self.augment and not self.rect  // load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
@@ -764,64 +764,81 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
-        """
-        Versione per SOTTOCARTELLE (Folder Structure).
-        Input: t-1, t
-        Target: t+1 (Forecasting)
-        """
-        index = self.indices[index]
+        """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
+        index = self.indices[index]  # linear, shuffled, or image_weights
+
         hyp = self.hyp
-        # Percorso del frame corrente
-        path_t = Path(self.im_files[index])
-        
-        # Controlli indici
-        has_prev = (index > 0)
-        has_next = (index < len(self.im_files) - 1)
-        path_prev = Path(self.im_files[index - 1]) if has_prev else None
-        path_next = Path(self.im_files[index + 1]) if has_next else None
-        
-        # --- 1. CARICAMENTO FRAME T-1 (PASSATO) ---
-        img1, (h01, w01), (h1, w1) = self.load_image(index) # Frame Corrente (t)
-        # LOGICA: Se il file precedente è nella STESSA CARTELLA del file corrente -> Stesso Video
-        if has_prev and path_prev.parent == path_t.parent:
-            img2, _, _ = self.load_image(index - 1)
+        if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
+            print("MOSAIC err")
+            # Load mosaic
+            img, labels = self.load_mosaic(index)
+            shapes = None
+
+            # MixUp augmentation
+            if random.random() < hyp["mixup"]:
+                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+
         else:
-            # Cartella diversa (o inizio dataset) -> Nuovo Video -> Duplichiamo
-            img2 = img1.copy()
-        
-        # --- 2. LETTERBOX ---
-        shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
-        img1, ratio, pad = letterbox(img1, shape, auto=False, scaleup=self.augment)
-        img2, _, _ = letterbox(img2, shape, auto=False, scaleup=self.augment)
-        shapes = (h01, w01), ((h1 / h01, w1 / w01), pad)
-        
-        # --- 3. CARICAMENTO LABEL (TARGET: t+1) ---
-        labels = None
-        
-        # LOGICA: Se il prossimo file è nella STESSA CARTELLA -> Stesso Video -> Prendi Label Futura
-        if has_next and path_next.parent == path_t.parent:
-            labels = self.labels[index + 1].copy()
-        
-        # Se labels è None (siamo all'ultimo frame della cartella/video)
-        if labels is None:
-            # Usiamo la label corrente come fallback
-            labels = self.labels[index].copy()
-        if labels.size:
-            # Adattiamo la label (xywh normalized) alle dimensioni del letterbox
-            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w1, ratio[1] * h1, padw=pad[0], padh=pad[1])
-       
-        # --- 4. FORMATTAZIONE ---
-        nl = len(labels)
+            # Load image
+            img, (h0, w0), (h, w) = self.load_image(index)
+
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+            future_index = index + 1 if index + 1 < len(self.labels) else index
+            labels = self.labels[future_index].copy()
+            if labels.size:  # normalized xywh to pixel xyxy format
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+            if self.augment:
+                img, labels = random_perspective(
+                    img,
+                    labels,
+                    degrees=hyp["degrees"],
+                    translate=hyp["translate"],
+                    scale=hyp["scale"],
+                    shear=hyp["shear"],
+                    perspective=hyp["perspective"],
+                )
+
+        nl = len(labels)  # number of labels
         if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img1.shape[1], h=img1.shape[0], clip=True, eps=1e-3)
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
+
+        if self.augment:
+            # Albumentations
+            img, labels = self.albumentations(img, labels)
+            nl = len(labels)  # update after albumentations
+
+            # HSV color-space
+            augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+
+            # Flip up-down
+            if random.random() < hyp["flipud"]:
+                img = np.flipud(img)
+                if nl:
+                    labels[:, 2] = 1 - labels[:, 2]
+
+            # Flip left-right
+            if random.random() < hyp["fliplr"]:
+                img = np.fliplr(img)
+                if nl:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+            # Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
+
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
-        
-        # --- 5. STACKING ---
-        img_stacked = np.concatenate((img2, img1), axis=2)
-        img = img_stacked.transpose((2, 0, 1))[::-1]
+
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
+
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
     def load_image(self, i):

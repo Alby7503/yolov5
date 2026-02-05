@@ -299,7 +299,7 @@ def train(hyp, opt, device, callbacks):
         image_weights=opt.image_weights,
         quad=opt.quad,
         prefix=colorstr("train: "),
-        shuffle=True,
+        shuffle=False,
         seed=opt.seed,
     )
     labels = np.concatenate(dataset.labels, 0)
