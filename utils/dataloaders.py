@@ -73,46 +73,50 @@ for orientation in ExifTags.TAGS.keys():
 
 import numpy as np
 
-def calculate_tal_weights(labels_curr, labels_fut, tau=0.5, nu=1.6):
+def calculate_tal_weights(labels_curr, labels_fut, tau=0.5, nu=1.6, scale=2):
     if len(labels_fut) == 0:
         return np.array([])
-    
+
     weights = np.ones((len(labels_fut), 1))
-    
+
     if len(labels_curr) > 0:
         for i, fut_box in enumerate(labels_fut):
             cls_fut = fut_box[0]
             curr_candidates = labels_curr[labels_curr[:, 0] == cls_fut]
-            
+
             if len(curr_candidates) > 0:
-                b1_x1, b1_x2 = fut_box[1] - fut_box[3]/2, fut_box[1] + fut_box[3]/2
-                b1_y1, b1_y2 = fut_box[2] - fut_box[4]/2, fut_box[2] + fut_box[4]/2
-                
-                b2_x1 = curr_candidates[:, 1] - curr_candidates[:, 3]/2
-                b2_x2 = curr_candidates[:, 1] + curr_candidates[:, 3]/2
-                b2_y1 = curr_candidates[:, 2] - curr_candidates[:, 4]/2
-                b2_y2 = curr_candidates[:, 2] + curr_candidates[:, 4]/2
-                
+                # Future Box (Inflated)
+                w1, h1 = fut_box[3] * scale, fut_box[4] * scale
+                b1_x1, b1_x2 = fut_box[1] - w1/2, fut_box[1] + w1/2
+                b1_y1, b1_y2 = fut_box[2] - h1/2, fut_box[2] + h1/2
+
+                # Current Candidates (Inflated)
+                w2, h2 = curr_candidates[:, 3] * scale, curr_candidates[:, 4] * scale
+                b2_x1 = curr_candidates[:, 1] - w2/2
+                b2_x2 = curr_candidates[:, 1] + w2/2
+                b2_y1 = curr_candidates[:, 2] - h2/2
+                b2_y2 = curr_candidates[:, 2] + h2/2
+
                 inter_x1 = np.maximum(b1_x1, b2_x1)
                 inter_y1 = np.maximum(b1_y1, b2_y1)
                 inter_x2 = np.minimum(b1_x2, b2_x2)
                 inter_y2 = np.minimum(b1_y2, b2_y2)
-                
+
                 inter_area = np.maximum(0, inter_x2 - inter_x1) * np.maximum(0, inter_y2 - inter_y1)
-                b1_area = fut_box[3] * fut_box[4]
-                b2_area = curr_candidates[:, 3] * curr_candidates[:, 4]
+                b1_area = w1 * h1
+                b2_area = w2 * h2
                 union = b1_area + b2_area - inter_area
                 ious = inter_area / (union + 1e-6)
-                
+
                 m_iou = np.max(ious) if len(ious) > 0 else 0.0
-                
+
                 if m_iou >= tau:
-                    weights[i] = 1.0 / m_iou
+                    weights[i] = 1.0 / m_iou  # High weight for trend
                 else:
-                    weights[i] = 1.0 / nu
+                    weights[i] = 1.0 / nu     # Low weight for noise
             else:
                 weights[i] = 1.0 / nu
-                
+
     return weights
 
 def get_hash(paths):
@@ -836,7 +840,7 @@ class LoadImagesAndLabels(Dataset):
 
             # 2. Load Future Frame Labels (Target)
             # Forecsting 2 frames ahead (approx 66ms at 30fps) to lead the target
-            future_index = index + 2 if index + 2 < len(self.labels) else index
+            future_index = index + 1 if index + 1 < len(self.labels) else index
             labels = self.labels[future_index].copy()
 
             # 3. Calculate Velocity Weights (Eq. 1 & 2 from paper)
