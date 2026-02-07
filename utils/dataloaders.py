@@ -71,6 +71,49 @@ for orientation in ExifTags.TAGS.keys():
     if ExifTags.TAGS[orientation] == "Orientation":
         break
 
+import numpy as np
+
+def calculate_tal_weights(labels_curr, labels_fut, tau=0.5, nu=1.6):
+    if len(labels_fut) == 0:
+        return np.array([])
+    
+    weights = np.ones((len(labels_fut), 1))
+    
+    if len(labels_curr) > 0:
+        for i, fut_box in enumerate(labels_fut):
+            cls_fut = fut_box[0]
+            curr_candidates = labels_curr[labels_curr[:, 0] == cls_fut]
+            
+            if len(curr_candidates) > 0:
+                b1_x1, b1_x2 = fut_box[1] - fut_box[3]/2, fut_box[1] + fut_box[3]/2
+                b1_y1, b1_y2 = fut_box[2] - fut_box[4]/2, fut_box[2] + fut_box[4]/2
+                
+                b2_x1 = curr_candidates[:, 1] - curr_candidates[:, 3]/2
+                b2_x2 = curr_candidates[:, 1] + curr_candidates[:, 3]/2
+                b2_y1 = curr_candidates[:, 2] - curr_candidates[:, 4]/2
+                b2_y2 = curr_candidates[:, 2] + curr_candidates[:, 4]/2
+                
+                inter_x1 = np.maximum(b1_x1, b2_x1)
+                inter_y1 = np.maximum(b1_y1, b2_y1)
+                inter_x2 = np.minimum(b1_x2, b2_x2)
+                inter_y2 = np.minimum(b1_y2, b2_y2)
+                
+                inter_area = np.maximum(0, inter_x2 - inter_x1) * np.maximum(0, inter_y2 - inter_y1)
+                b1_area = fut_box[3] * fut_box[4]
+                b2_area = curr_candidates[:, 3] * curr_candidates[:, 4]
+                union = b1_area + b2_area - inter_area
+                ious = inter_area / (union + 1e-6)
+                
+                m_iou = np.max(ious) if len(ious) > 0 else 0.0
+                
+                if m_iou >= tau:
+                    weights[i] = 1.0 / m_iou
+                else:
+                    weights[i] = 1.0 / nu
+            else:
+                weights[i] = 1.0 / nu
+                
+    return weights
 
 def get_hash(paths):
     """Generates a single SHA256 hash for a list of file or directory paths by combining their sizes and paths."""
@@ -768,8 +811,7 @@ class LoadImagesAndLabels(Dataset):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
-        if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
-            print("MOSAIC err")
+        if False and mosaic := self.mosaic and random.random() < hyp["mosaic"]:
             # Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None
@@ -787,12 +829,34 @@ class LoadImagesAndLabels(Dataset):
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
-            future_index = index + 1 if index + 1 < len(self.labels) else index
+            # --- TREND-AWARE LOSS LOGIC START ---
+            
+            # 1. Load Current Frame Labels (for velocity calculation)
+            labels_curr = self.labels[index].copy()
+
+            # 2. Load Future Frame Labels (Target)
+            # Forecsting 2 frames ahead (approx 66ms at 30fps) to lead the target
+            future_index = index + 2 if index + 2 < len(self.labels) else index
             labels = self.labels[future_index].copy()
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+            # 3. Calculate Velocity Weights (Eq. 1 & 2 from paper)
+            # This returns a (N, 1) array of weights
+            weights = calculate_tal_weights(labels_curr, labels)
+
+            # 4. Append Weights to Labels
+            # labels becomes [N, 6] -> [class, x, y, w, h, velocity_weight]
+            if labels.size:
+                labels = np.hstack((labels, weights))
+                
+                # 5. Transform normalized xywh to pixel xyxy
+                # Change slice from [:, 1:] to [:, 1:5] to only touch coords
+                labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+            
+            # --- TREND-AWARE LOSS LOGIC END ---
 
             if self.augment:
+                # random_perspective will carry the 6th column (weights) 
+                # along with the boxes, keeping them matched even if boxes are cropped.
                 img, labels = random_perspective(
                     img,
                     labels,
@@ -805,12 +869,16 @@ class LoadImagesAndLabels(Dataset):
 
         nl = len(labels)  # number of labels
         if nl:
+            # Convert pixel xyxy back to normalized xywh
+            # Slice [:, 1:5] to preserve the weight column at index 5
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
         if self.augment:
             # Albumentations
-            img, labels = self.albumentations(img, labels)
-            nl = len(labels)  # update after albumentations
+            # Commented out because standard Albumentations might crash 
+            # when receiving 6 columns (it expects 5). 
+            # img, labels = self.albumentations(img, labels)
+            # nl = len(labels)  # update after albumentations
 
             # HSV color-space
             augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
@@ -827,12 +895,13 @@ class LoadImagesAndLabels(Dataset):
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
 
-            # Cutouts
-            # labels = cutout(img, labels, p=0.5)
-            # nl = len(labels)  # update after cutout
-
-        labels_out = torch.zeros((nl, 6))
+        # --- FINAL OUTPUT FORMATTING (CRITICAL CHANGE) ---
+        # Standard YOLOv5 uses 6 columns: [img_index, class, x, y, w, h]
+        # We need 7 columns: [img_index, class, x, y, w, h, velocity_weight]
+        
+        labels_out = torch.zeros((nl, 7)) # <--- CHANGED FROM 6 TO 7
         if nl:
+            # Assign our [N, 6] labels to the last 6 columns of labels_out
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
