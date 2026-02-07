@@ -811,7 +811,7 @@ class LoadImagesAndLabels(Dataset):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
-        if False and mosaic := self.mosaic and random.random() < hyp["mosaic"]:
+        if False: #mosaic := self.mosaic and random.random() < hyp["mosaic"]:
             # Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None

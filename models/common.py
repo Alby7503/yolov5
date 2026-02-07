@@ -108,27 +108,30 @@ class DWConv(Conv):
 
 
 class DFP(nn.Module):
-    # Dual-Flow Perception Module from StreamYOLO
+    # Dual-Flow Perception Module
     def __init__(self, c1):
         super().__init__()
-        # Takes (Current + Prev) channels -> Reduces to Original channels
-        # Uses 1x1 Convolution to fuse
-        self.fusion = Conv(c1 * 2, c1, k=1)
+        # 1. Shared 1x1 Conv to reduce channels by half 
+        #    Input: c1 -> Output: c1 // 2
+        self.reduce = Conv(c1, c1 // 2, k=1) 
 
     def forward(self, x_curr, x_prev):
-        # 1. Cold Start Handling (First frame has no history)
-        if x_prev is None:
+        # Cold Start: duplicate current frame if history is missing [cite: 252]
+        if x_prev is None or x_curr.shape != x_prev.shape:
             x_prev = x_curr
 
-        # 2. Check shapes (Safety for different resolutions)
-        if x_curr.shape != x_prev.shape:
-            x_prev = x_curr
+        # --- DYNAMIC FLOW ---
+        # A. Apply Shared Weight Reduction to BOTH frames separately
+        x_curr_red = self.reduce(x_curr)
+        x_prev_red = self.reduce(x_prev)
 
-        # 3. Concatenate Features (Batch, Channels*2, H, W)
-        x_combined = torch.cat([x_curr, x_prev], dim=1)
+        # B. Concatenate the reduced features 
+        #    (c1//2) + (c1//2) -> c1
+        x_dynamic = torch.cat([x_curr_red, x_prev_red], dim=1)
 
-        # 4. Fuse back to original size
-        return self.fusion(x_combined)
+        # --- STATIC FLOW  ---
+        # C. Residual Connection: Add original current feature to dynamic result
+        return x_dynamic + x_curr
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):
