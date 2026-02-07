@@ -293,7 +293,7 @@ def train(hyp, opt, device, callbacks):
         hyp=hyp,
         augment=True,
         cache=None if opt.cache == "val" else opt.cache,
-        rect=opt.rect,
+        rect=False,
         rank=LOCAL_RANK,
         workers=workers,
         image_weights=opt.image_weights,
@@ -716,7 +716,7 @@ def main(opt, callbacks=Callbacks()):
             "shear": (True, 0.0, 10.0),  # image shear (+/- deg)
             "perspective": (True, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
             "flipud": (True, 0.0, 1.0),  # image flip up-down (probability)
-            "fliplr": (True, 0.0, 1.0),  # image flip left-right (probability)
+            "fliplr": (False, 0.0, 0.0),  # image flip left-right (probability)
             "mosaic": (True, 0.0, 1.0),  # image mosaic (probability)
             "mixup": (True, 0.0, 1.0),  # image mixup (probability)
             "copy_paste": (True, 0.0, 1.0),  # segment copy-paste (probability)
