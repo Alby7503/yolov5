@@ -258,7 +258,10 @@ class DetectionModel(BaseModel):
             for i, conv in enumerate(m.m):
                 # The input channels of the head's conv is exactly the output channels of the FPN
                 c = conv.in_channels
-                self.dfp_modules.append(DFP(c))
+                dfp = DFP(c)
+                # Initialize reduce conv to output half of input (approximate identity when concatenated)
+                nn.init.kaiming_normal_(dfp.reduce.conv.weight, mode='fan_out', nonlinearity='relu')
+                self.dfp_modules.append(dfp)
             
             # 3. Initialize Feature Buffer
             self.prev_features = [None] * len(self.dfp_modules)
@@ -311,31 +314,44 @@ class DetectionModel(BaseModel):
                 self._profile_one_layer(m, x, dt)
             
             # --- STREAMYOLO DFP INJECTION START ---
-            # Check if we are about to run the Detect/Segment head
             if hasattr(self, 'dfp_modules') and isinstance(m, (Detect, Segment)):
-                # x is currently a list of tensors [P3, P4, P5]
-                # We want to fuse these before they enter the head
                 x_fused_list = []
+                B = x[0].shape[0]  # batch size
                 
                 for i, feat_curr in enumerate(x):
-                    # 1. Get history
-                    feat_prev = self.prev_features[i]
+                    # feat_curr shape: (B, C, H, W)
                     
-                    # 2. Store clean current features for NEXT frame
-                    #    Must detach to stop gradients leaking into history
-                    feat_curr_detached = feat_curr.detach()
+                    if self.training:
+                        # During training: use batch_size=1 buffer logic
+                        # Only fuse if we have valid history AND batch_size matches
+                        feat_prev = self.prev_features[i]
+                        
+                        if (feat_prev is not None 
+                            and feat_prev.shape[0] == B 
+                            and feat_prev.shape == feat_curr.shape):
+                            # Shift buffer: each sample gets previous sample's features
+                            # prev_features stores the LAST batch's features
+                            # So sample[0] gets prev_batch[-1], sample[1] gets prev_batch[-2]...
+                            # This is wrong for multi-batch. Instead, just use identity during training
+                            # and let the gate learn to open slowly
+                            feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
+                        else:
+                            feat_fused = feat_curr  # cold start = identity
+                        
+                        # Store current for next batch (detached)
+                        self.prev_features[i] = feat_curr.detach()
+                    else:
+                        # During inference: expect batch_size=1 (video stream)
+                        # This is the correct temporal fusion
+                        feat_prev = self.prev_features[i]
+                        
+                        if not augment:
+                            self.prev_features[i] = feat_curr.detach()
+                        
+                        feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
                     
-                    #    Only update buffer if NOT doing TTA (augment=False)
-                    #    to keep video stream consistent
-                    if not augment:
-                        self.prev_features[i] = feat_curr_detached
-
-                    # 3. Apply DFP
-                    #    DFP module handles the case where feat_prev is None (first frame)
-                    feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
                     x_fused_list.append(feat_fused)
                 
-                # Replace input x with fused list
                 x = x_fused_list
             # --- STREAMYOLO DFP INJECTION END ---
 

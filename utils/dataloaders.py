@@ -1087,7 +1087,7 @@ class LoadImagesAndLabels(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Batches images, labels, paths, and shapes, assigning unique indices to targets in merged label tensor."""
+        """Collates image, label, path, and shape data into batches, handling 7-column labels for StreamYOLO."""
         im, label, path, shapes = zip(*batch)  # transposed
         for i, lb in enumerate(label):
             lb[:, 0] = i  # add target image index for build_targets()
@@ -1095,24 +1095,23 @@ class LoadImagesAndLabels(Dataset):
 
     @staticmethod
     def collate_fn4(batch):
-        """Bundles a batch's data by quartering the number of shapes and paths, preparing it for model input."""
+        """Collates images into 4-image mosaics, adjusts labels and shapes for quad-batch processing."""
         im, label, path, shapes = zip(*batch)  # transposed
         n = len(shapes) // 4
         im4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
-        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
-        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
-        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
-        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
+        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0, 0]])  # 7 columns now
+        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0, 0]])  # 7 columns now
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5, 1]])  # 7 columns: scale xywh, keep weight
+
+        for i in range(n):  # zidane torch.zeros(16, 3, 720, 1280)  # BCHW
             i *= 4
             if random.random() < 0.5:
-                im1 = F.interpolate(im[i].unsqueeze(0).float(), scale_factor=2.0, mode="bilinear", align_corners=False)[
-                    0
-                ].type(im[i].type())
-                lb = label[i]
-            else:
                 im1 = torch.cat((torch.cat((im[i], im[i + 1]), 1), torch.cat((im[i + 2], im[i + 3]), 1)), 2)
                 lb = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
+            else:
+                im1 = torch.cat((torch.cat((im[i], im[i + 1]), 2), torch.cat((im[i + 2], im[i + 3]), 2)), 1)
+                lb = torch.cat((label[i], label[i + 1] + wo, label[i + 2] + ho, label[i + 3] + ho + wo), 0) * s
             im4.append(im1)
             label4.append(lb)
 

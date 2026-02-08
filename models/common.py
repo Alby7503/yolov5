@@ -109,27 +109,24 @@ class DFP(nn.Module):
     # Dual-Flow Perception Module
     def __init__(self, c1):
         super().__init__()
-        # 1. Shared 1x1 Conv to reduce channels by half 
-        #    Input: c1 -> Output: c1 // 2
-        self.reduce = Conv(c1, c1 // 2, k=1) 
+        self.reduce = Conv(c1, c1 // 2, k=1)
+        # Gate parameter: starts at -5 so sigmoid(-5) ≈ 0.007 (nearly closed)
+        # The network will learn to open it as training progresses
+        self.gate = nn.Parameter(torch.tensor([-5.0]))
 
     def forward(self, x_curr, x_prev):
-        # Cold Start: duplicate current frame if history is missing [cite: 252]
+        # Cold Start: if no history, return current features UNCHANGED
         if x_prev is None or x_curr.shape != x_prev.shape:
-            x_prev = x_curr
+            return x_curr
 
         # --- DYNAMIC FLOW ---
-        # A. Apply Shared Weight Reduction to BOTH frames separately
         x_curr_red = self.reduce(x_curr)
         x_prev_red = self.reduce(x_prev)
-
-        # B. Concatenate the reduced features 
-        #    (c1//2) + (c1//2) -> c1
         x_dynamic = torch.cat([x_curr_red, x_prev_red], dim=1)
 
-        # --- STATIC FLOW  ---
-        # C. Residual Connection: Add original current feature to dynamic result
-        return x_dynamic + x_curr
+        # --- GATED RESIDUAL ---
+        alpha = torch.sigmoid(self.gate)  # starts at ~0.007
+        return x_curr + alpha * (x_dynamic - x_curr)
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):

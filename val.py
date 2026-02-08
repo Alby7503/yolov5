@@ -342,8 +342,10 @@ def run(
             loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
         # NMS
-        targets[:, 2:6] *= torch.tensor((width, height, width, height), device=device) # to pixels
-        lb = [targets[targets[:, 0] == i, 1:6] for i in range(nb)] if save_hybrid else []  # for autolabelling
+        # Scale only the bbox columns (2:6), leaving weight column (6) untouched
+        targets[:, 2:6] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        lb = [targets[targets[:, 0] == i, 1:6] for i in range(nb)] if save_hybrid else []  # for autolabelling (exclude weight column)
+
         with dt[2]:
             preds = non_max_suppression(
                 preds, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, max_det=max_det
@@ -351,7 +353,7 @@ def run(
 
         # Metrics
         for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si, 1:6]
+            labels = targets[targets[:, 0] == si, 1:6]  # exclude weight column (index 6)
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
             path, shape = Path(paths[si]), shapes[si][0]
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init

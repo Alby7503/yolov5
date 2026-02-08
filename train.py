@@ -398,6 +398,18 @@ def train(hyp, opt, device, callbacks):
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
+            # --- STREAMYOLO: Reset DFP buffer at zone boundaries ---
+            if i > 0 and hasattr(de_parallel(model), 'reset_buffer'):
+                # Check if zone changed between this batch and the previous one
+                current_zone = Path(paths[0]).stem.rsplit('_frame_')[0]  # e.g., "zone_02"
+                if hasattr(train_loader, '_prev_zone') and train_loader._prev_zone != current_zone:
+                    de_parallel(model).reset_buffer()
+                train_loader._prev_zone = current_zone
+            elif i == 0 and hasattr(de_parallel(model), 'reset_buffer'):
+                de_parallel(model).reset_buffer()  # Reset at start of each epoch
+                if len(paths) > 0:
+                    train_loader._prev_zone = Path(paths[0]).stem.rsplit('_frame_')[0]
+
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -463,12 +475,17 @@ def train(hyp, opt, device, callbacks):
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
+                # Reset DFP buffer before validation to avoid stale features
+                ema_model = ema.ema
+                if hasattr(ema_model, 'reset_buffer'):
+                    ema_model.reset_buffer()
+                
                 results, maps, _ = validate.run(
                     data_dict,
                     batch_size=batch_size // WORLD_SIZE * 2,
                     imgsz=imgsz,
                     half=amp,
-                    model=ema.ema,
+                    model=ema_model,
                     single_cls=single_cls,
                     dataloader=val_loader,
                     save_dir=save_dir,
