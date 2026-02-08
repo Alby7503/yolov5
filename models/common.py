@@ -104,8 +104,6 @@ class DWConv(Conv):
         """
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
 
-# --- ADD TO models/common.py ---
-
 
 class DFP(nn.Module):
     # Dual-Flow Perception Module

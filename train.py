@@ -214,15 +214,21 @@ def train(hyp, opt, device, callbacks):
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)
+        # 1. Load the file
         ckpt = torch_load(weights, map_location="cpu")
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+        if isinstance(ckpt, dict) and 'model' not in ckpt:
+            print(f"Loading clean weights from {weights}...")
+            csd = ckpt  # It is already the state_dict
+        else:
+            csd = ckpt['model'].float().state_dict()
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
-        csd = ckpt["model"].float().state_dict()
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
+
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
     
     amp = check_amp(model)  # check AMP
 
