@@ -294,7 +294,7 @@ def train(hyp, opt, device, callbacks):
         hyp=hyp,
         augment=True,
         cache=None if opt.cache == "val" else opt.cache,
-        rect=False,
+        rect=opt.rect,
         rank=LOCAL_RANK,
         workers=workers,
         image_weights=opt.image_weights,
