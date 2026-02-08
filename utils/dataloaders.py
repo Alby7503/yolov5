@@ -242,7 +242,6 @@ def create_dataloader(
             prefix=prefix,
             rank=rank,
         )
-
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
@@ -700,14 +699,14 @@ class LoadImagesAndLabels(Dataset):
             # Sort by aspect ratio
             s = self.shapes  # wh
             ar = s[:, 1] / s[:, 0]  # aspect ratio
-            irect = ar.argsort()
+            '''irect = ar.argsort()
             self.im_files = [self.im_files[i] for i in irect]
             self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.segments = [self.segments[i] for i in irect]
             self.shapes = s[irect]  # wh
             ar = ar[irect]
-
+            '''
             # Set training image shapes
             shapes = [[1, 1]] * nb
             for i in range(nb):
