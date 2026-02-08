@@ -41,7 +41,7 @@ from models.common import (
     Conv,
     CrossConv,
     DetectMultiBackend,
-    DFP,    #La nostra implementazione di DFP
+    DFP,    # StreamYOLO DFP Module
     DWConv,
     DWConvTranspose2d,
     Expand,
@@ -242,19 +242,28 @@ class DetectionModel(BaseModel):
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         
         # --- STREAMYOLO DFP INIT START ---
-        # Define which layers are the Backbone outputs (P3, P4, P5).
-        # In standard YOLOv5s, these are layers 4, 6, and 9.
-        self.dfp_indices = [4, 6, 9] 
+        # 1. Identify Detect/Segment Head
+        # In YOLOv5, this is typically the last layer.
+        m = self.model[-1]
         
-        # Create a DFP module for each scale
-        # We try to grab channels dynamically. If that fails, we fallback to hardcoded v5s numbers (128, 256, 512).
-        self.dfp_modules = nn.ModuleList([
-            DFP(self.model[4].cv3.conv.out_channels if hasattr(self.model[4], 'cv3') else 128),
-            DFP(self.model[6].cv3.conv.out_channels if hasattr(self.model[6], 'cv3') else 256),
-            DFP(self.model[9].cv2.conv.out_channels if hasattr(self.model[9], 'cv2') else 512)
-        ])
-        # Buffer to hold features from the previous frame
-        self.prev_features = [None, None, None]
+        # Verify it is indeed a Detect or Segment head
+        if isinstance(m, (Detect, Segment)):
+            LOGGER.info(f"StreamYOLO: Initializing DFP for {type(m).__name__} head")
+            
+            # 2. Initialize DFP modules
+            # We must match the input channels of the Detect head.
+            # m.m is the ModuleList of convolutions inside Detect.
+            # m.m[i] corresponds to the i-th input feature map.
+            self.dfp_modules = nn.ModuleList()
+            for i, conv in enumerate(m.m):
+                # The input channels of the head's conv is exactly the output channels of the FPN
+                c = conv.in_channels
+                self.dfp_modules.append(DFP(c))
+            
+            # 3. Initialize Feature Buffer
+            self.prev_features = [None] * len(self.dfp_modules)
+        else:
+            LOGGER.warning("StreamYOLO: Could not find Detect/Segment head at model[-1]. DFP disabled.")
         # --- STREAMYOLO DFP INIT END ---
         
         self.names = [str(i) for i in range(self.yaml["nc"])]  # default names
@@ -287,6 +296,60 @@ class DetectionModel(BaseModel):
             return self._forward_augment(x)  # augmented inference, None
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
+    def _forward_once(self, x, profile=False, visualize=False, augment=False):
+        """
+        Modified forward pass for StreamYOLO DFP injection.
+        Overrides BaseModel._forward_once to intercept Detect inputs.
+        """
+        y, dt = [], []  # outputs
+        for m in self.model:
+            # 1. Standard connection logic
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            
+            # --- STREAMYOLO DFP INJECTION START ---
+            # Check if we are about to run the Detect/Segment head
+            if hasattr(self, 'dfp_modules') and isinstance(m, (Detect, Segment)):
+                # x is currently a list of tensors [P3, P4, P5]
+                # We want to fuse these before they enter the head
+                x_fused_list = []
+                
+                for i, feat_curr in enumerate(x):
+                    # 1. Get history
+                    feat_prev = self.prev_features[i]
+                    
+                    # 2. Store clean current features for NEXT frame
+                    #    Must detach to stop gradients leaking into history
+                    feat_curr_detached = feat_curr.detach()
+                    
+                    #    Only update buffer if NOT doing TTA (augment=False)
+                    #    to keep video stream consistent
+                    if not augment:
+                        self.prev_features[i] = feat_curr_detached
+
+                    # 3. Apply DFP
+                    #    DFP module handles the case where feat_prev is None (first frame)
+                    feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
+                    x_fused_list.append(feat_fused)
+                
+                # Replace input x with fused list
+                x = x_fused_list
+            # --- STREAMYOLO DFP INJECTION END ---
+
+            # 2. Run the layer
+            x = m(x)
+
+            # 3. Save output
+            y.append(x if m.i in self.save else None)
+            
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+                
+        return x
+
     def _forward_augment(self, x):
         """Performs augmented inference across different scales and flips, returning combined detections."""
         img_size = x.shape[-2:]  # height, width
@@ -295,7 +358,10 @@ class DetectionModel(BaseModel):
         y = []  # outputs
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = self._forward_once(xi)[0]  # forward
+            
+            # Pass augment=True to prevent buffer corruption
+            yi = self._forward_once(xi, augment=True)[0]  # forward
+            
             # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
@@ -346,6 +412,11 @@ class DetectionModel(BaseModel):
                 math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())
             )  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+    
+    def reset_buffer(self):
+        """Reset history buffer for new video or validation start."""
+        if hasattr(self, 'prev_features'):
+            self.prev_features = [None] * len(self.dfp_modules)
 
 
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility

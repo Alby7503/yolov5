@@ -73,7 +73,7 @@ for orientation in ExifTags.TAGS.keys():
 
 import numpy as np
 
-def calculate_tal_weights(labels_curr, labels_fut, tau=0.5, nu=1.6, scale=2):
+def calculate_tal_weights(labels_curr, labels_fut, tau=0.3, nu=1.6, scale=1):
     if len(labels_fut) == 0:
         return np.array([])
 

@@ -305,7 +305,7 @@ def run(
             stride,
             single_cls,
             pad=pad,
-            rect=rect,
+            rect=False,
             workers=workers,
             prefix=colorstr(f"{task}: "),
         )[0]
