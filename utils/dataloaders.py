@@ -73,11 +73,13 @@ for orientation in ExifTags.TAGS.keys():
 
 import numpy as np
 
-def calculate_tal_weights(labels_curr, labels_fut, tau=0.3, nu=1.6, scale=1):
+def calculate_tal_weights(labels_curr, labels_fut, tau=0.25, nu=2, scale=1.3):
     if len(labels_fut) == 0:
         return np.array([])
 
     weights = np.ones((len(labels_fut), 1))
+
+    noise_weight = 1.0 / nu
 
     if len(labels_curr) > 0:
         for i, fut_box in enumerate(labels_fut):
@@ -111,11 +113,12 @@ def calculate_tal_weights(labels_curr, labels_fut, tau=0.3, nu=1.6, scale=1):
                 m_iou = np.max(ious) if len(ious) > 0 else 0.0
 
                 if m_iou >= tau:
-                    weights[i] = 1.0 / m_iou  # High weight for trend
+                    w = 1.0 / (m_iou + 1e-4) # 1e-4 per evitare division by zero
+                    weights[i] = min(w, 4.0)
                 else:
-                    weights[i] = 1.0 / nu     # Low weight for noise
+                    weights[i] = noise_weight     # Low weight for noise
             else:
-                weights[i] = 1.0 / nu
+                weights[i] = noise_weight
 
     return weights
 

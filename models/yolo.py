@@ -312,26 +312,46 @@ class DetectionModel(BaseModel):
             
             # --- STREAMYOLO DFP INJECTION START ---
             # Check if we are about to run the Detect/Segment head
+            
             if hasattr(self, 'dfp_modules') and isinstance(m, (Detect, Segment)):
-                # x is currently a list of tensors [P3, P4, P5]
-                # We want to fuse these before they enter the head
                 x_fused_list = []
-                
                 for i, feat_curr in enumerate(x):
-                    # 1. Get history
-                    feat_prev = self.prev_features[i]
+                    # feat_curr shape: [Batch, Channels, Height, Width]
                     
-                    # 2. Store clean current features for NEXT frame
-                    #    Must detach to stop gradients leaking into history
-                    feat_curr_detached = feat_curr.detach()
+                    # 1. Recuperiamo l'ultimo frame del BATCH PRECEDENTE (Buffer)
+                    #    Forma attesa: [1, C, H, W]
+                    last_frame_prev_batch = self.prev_features[i]
                     
-                    #    Only update buffer if NOT doing TTA (augment=False)
-                    #    to keep video stream consistent
-                    if not augment:
-                        self.prev_features[i] = feat_curr_detached
+                    # 2. Creiamo lo "storico" SHIFTANDO il batch corrente
+                    #    Prendiamo tutti i frame tranne l'ultimo: [0, 1, ..., B-2]
+                    #    Questi saranno il "passato" per i frame [1, 2, ..., B-1]0
+                    #    Forma: [B-1, C, H, W]
+                    
+                    if last_frame_prev_batch is not None:
+                        last_frame_prev_batch = last_frame_prev_batch.to(feat_curr.device)
+                    
+                    intra_batch_history = feat_curr[:-1]
 
-                    # 3. Apply DFP
-                    #    DFP module handles the case where feat_prev is None (first frame)
+                    # 3. Assembliamo il tensore feat_prev completo
+                    if last_frame_prev_batch is None or last_frame_prev_batch.shape[1:] != feat_curr.shape[1:]:
+                        # COLD START (Primo Batch o cambio risoluzione):
+                        # Il Frame 0 usa se stesso come passato.
+                        # I Frame 1..N usano i frame 0..N-1.
+                        feat_prev = torch.cat([feat_curr[0:1], intra_batch_history], dim=0)
+                    else:
+                        # REGIME NORMALE:
+                        # Il Frame 0 usa l'ultimo del batch scorso.
+                        # I Frame 1..N usano i frame 0..N-1.
+                        feat_prev = torch.cat([last_frame_prev_batch, intra_batch_history], dim=0)
+                    
+                    # 4. Aggiorniamo il Buffer per il PROSSIMO batch
+                    #    Salviamo SOLO l'ultimo frame del batch corrente.
+                    #    Lo stacchiamo dal grafo per non propagare gradienti infiniti nel tempo.
+                    if not augment:
+                        self.prev_features[i] = feat_curr[-1:].detach() # Salva slice [1, C, H, W]
+
+                    # 5. Applichiamo il DFP
+                    #    Ora feat_prev è perfettamente allineato (lag = 1 frame)
                     feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
                     x_fused_list.append(feat_fused)
                 
