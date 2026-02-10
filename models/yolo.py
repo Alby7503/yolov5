@@ -202,17 +202,20 @@ class BaseModel(nn.Module):
         """Prints model information given verbosity and image size, e.g., `info(verbose=True, img_size=640)`."""
         model_info(self, verbose, img_size)
 
+    def reset_buffer(self):
+        """Reset history buffer for new video or validation start."""
+        if hasattr(self, 'prev_features'):
+            self.prev_features = [None] * len(self.dfp_modules)
+
     def _apply(self, fn):
-        """Applies transformations like to(), cpu(), cuda(), half() to model tensors excluding parameters or registered
-        buffers.
-        """
+        """Applies transformations like to(), cpu(), cuda(), half() to model tensors INCLUDING DFP buffers."""
         self = super()._apply(fn)
-        m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
-            m.stride = fn(m.stride)
-            m.grid = list(map(fn, m.grid))
-            if isinstance(m.anchor_grid, list):
-                m.anchor_grid = list(map(fn, m.anchor_grid))
+        # Move DFP feature buffers to the new device/dtype
+        if hasattr(self, 'prev_features'):
+            for i in range(len(self.prev_features)):
+                if self.prev_features[i] is not None:
+                    # fn is the transformation function (e.g., lambda t: t.cuda())
+                    self.prev_features[i] = fn(self.prev_features[i])
         return self
 
 
@@ -256,11 +259,9 @@ class DetectionModel(BaseModel):
             # m.m[i] corresponds to the i-th input feature map.
             self.dfp_modules = nn.ModuleList()
             for i, conv in enumerate(m.m):
-                # The input channels of the head's conv is exactly the output channels of the FPN
                 c = conv.in_channels
                 dfp = DFP(c)
-                # Initialize reduce conv to output half of input (approximate identity when concatenated)
-                nn.init.kaiming_normal_(dfp.reduce.conv.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(dfp.motion_conv.conv.weight, mode='fan_out', nonlinearity='relu')
                 self.dfp_modules.append(dfp)
             
             # 3. Initialize Feature Buffer
@@ -317,38 +318,50 @@ class DetectionModel(BaseModel):
             if hasattr(self, 'dfp_modules') and isinstance(m, (Detect, Segment)):
                 x_fused_list = []
                 B = x[0].shape[0]  # batch size
+                # Determine the target device from current input features
+                target_device = x[0].device
+                target_dtype = x[0].dtype
                 
                 for i, feat_curr in enumerate(x):
                     # feat_curr shape: (B, C, H, W)
                     
                     if self.training:
                         # During training: use batch_size=1 buffer logic
-                        # Only fuse if we have valid history AND batch_size matches
                         feat_prev = self.prev_features[i]
+                        
+                        # --- DEVICE/DTYPE SAFETY on buffer retrieval ---
+                        if feat_prev is not None:
+                            if feat_prev.device != target_device:
+                                feat_prev = feat_prev.to(target_device)
+                            if feat_prev.dtype != target_dtype:
+                                feat_prev = feat_prev.to(dtype=target_dtype)
                         
                         if (feat_prev is not None 
                             and feat_prev.shape[0] == B 
                             and feat_prev.shape == feat_curr.shape):
-                            # Shift buffer: each sample gets previous sample's features
-                            # prev_features stores the LAST batch's features
-                            # So sample[0] gets prev_batch[-1], sample[1] gets prev_batch[-2]...
-                            # This is wrong for multi-batch. Instead, just use identity during training
-                            # and let the gate learn to open slowly
                             feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
                         else:
                             feat_fused = feat_curr  # cold start = identity
                         
-                        # Store current for next batch (detached)
+                        # Store current for next batch (detached, kept on current device)
                         self.prev_features[i] = feat_curr.detach()
                     else:
-                        # During inference: expect batch_size=1 (video stream)
-                        # This is the correct temporal fusion
+                        # During inference/validation: expect batch_size=1 (video stream)
                         feat_prev = self.prev_features[i]
                         
+                        # --- DEVICE/DTYPE SAFETY on buffer retrieval ---
+                        if feat_prev is not None:
+                            if feat_prev.device != target_device:
+                                feat_prev = feat_prev.to(target_device)
+                            if feat_prev.dtype != target_dtype:
+                                feat_prev = feat_prev.to(dtype=target_dtype)
+                        
+                        # Run DFP FIRST, then update buffer
+                        feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
+                        
+                        # Store current features for next frame (skip during augmented inference)
                         if not augment:
                             self.prev_features[i] = feat_curr.detach()
-                        
-                        feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
                     
                     x_fused_list.append(feat_fused)
                 

@@ -106,27 +106,41 @@ class DWConv(Conv):
 
 
 class DFP(nn.Module):
-    # Dual-Flow Perception Module
+    """Dual-Flow Perception Module (StreamYOLO Paper Specification).
+    
+    The module computes a temporal residual correction from the difference
+    between current and previous features, then gates it onto the current features.
+    This ensures the output stays in the same feature space as x_curr.
+    """
     def __init__(self, c1):
         super().__init__()
-        self.reduce = Conv(c1, c1 // 2, k=1)
-        # Gate parameter: starts at -5 so sigmoid(-5) ≈ 0.007 (nearly closed)
-        # The network will learn to open it as training progresses
+        # Process the concatenation of current and motion (difference) features
+        # Input: cat(x_curr, x_curr - x_prev) → 2*c1 channels
+        # Output: c1 channels (residual correction in same space as x_curr)
+        self.motion_conv = Conv(c1 * 2, c1, k=1)
+        # Learnable gate: starts nearly closed so early training ≈ standard YOLOv5
         self.gate = nn.Parameter(torch.tensor([-5.0]))
 
     def forward(self, x_curr, x_prev):
-        # Cold Start: if no history, return current features UNCHANGED
+        # Cold start: no previous frame available
         if x_prev is None or x_curr.shape != x_prev.shape:
             return x_curr
 
-        # --- DYNAMIC FLOW ---
-        x_curr_red = self.reduce(x_curr)
-        x_prev_red = self.reduce(x_prev)
-        x_dynamic = torch.cat([x_curr_red, x_prev_red], dim=1)
+        # Device/dtype safety
+        if x_prev.device != x_curr.device:
+            x_prev = x_prev.to(x_curr.device)
+        if x_prev.dtype != x_curr.dtype:
+            x_prev = x_prev.to(dtype=x_curr.dtype)
 
-        # --- GATED RESIDUAL ---
-        alpha = torch.sigmoid(self.gate)  # starts at ~0.007
-        return x_curr + alpha * (x_dynamic - x_curr)
+        # Motion feature = difference between current and previous
+        x_motion = x_curr - x_prev
+
+        # Fuse current appearance with motion into a residual correction
+        x_residual = self.motion_conv(torch.cat([x_curr, x_motion], dim=1))
+
+        # Gated residual addition (both tensors in same feature space)
+        alpha = torch.sigmoid(self.gate)
+        return x_curr + alpha * x_residual
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):
