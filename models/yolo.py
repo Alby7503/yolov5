@@ -326,7 +326,7 @@ class DetectionModel(BaseModel):
                     # feat_curr shape: (B, C, H, W)
                     
                     if self.training:
-                        # During training: use batch_size=1 buffer logic
+                        # During training: use buffer logic for temporal fusion
                         feat_prev = self.prev_features[i]
                         
                         # --- DEVICE/DTYPE SAFETY on buffer retrieval ---
@@ -346,22 +346,29 @@ class DetectionModel(BaseModel):
                         # Store current for next batch (detached, kept on current device)
                         self.prev_features[i] = feat_curr.detach()
                     else:
-                        # During inference/validation: expect batch_size=1 (video stream)
-                        feat_prev = self.prev_features[i]
-                        
-                        # --- DEVICE/DTYPE SAFETY on buffer retrieval ---
-                        if feat_prev is not None:
-                            if feat_prev.device != target_device:
-                                feat_prev = feat_prev.to(target_device)
-                            if feat_prev.dtype != target_dtype:
-                                feat_prev = feat_prev.to(dtype=target_dtype)
-                        
-                        # Run DFP FIRST, then update buffer
-                        feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
-                        
-                        # Store current features for next frame (skip during augmented inference)
-                        if not augment:
-                            self.prev_features[i] = feat_curr.detach()
+                        # During inference/validation:
+                        # Only apply DFP for batch_size=1 (sequential video stream).
+                        # For batched validation (B>1), images are NOT temporally 
+                        # sequential so DFP would corrupt detections and kill recall.
+                        if B == 1:
+                            feat_prev = self.prev_features[i]
+                            
+                            # --- DEVICE/DTYPE SAFETY on buffer retrieval ---
+                            if feat_prev is not None:
+                                if feat_prev.device != target_device:
+                                    feat_prev = feat_prev.to(target_device)
+                                if feat_prev.dtype != target_dtype:
+                                    feat_prev = feat_prev.to(dtype=target_dtype)
+                            
+                            # Run DFP FIRST, then update buffer
+                            feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
+                            
+                            # Store current features for next frame
+                            if not augment:
+                                self.prev_features[i] = feat_curr.detach()
+                        else:
+                            # Batched eval: skip DFP, use raw features (identity)
+                            feat_fused = feat_curr
                     
                     x_fused_list.append(feat_fused)
                 

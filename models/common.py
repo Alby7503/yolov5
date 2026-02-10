@@ -118,8 +118,9 @@ class DFP(nn.Module):
         # Input: cat(x_curr, x_curr - x_prev) → 2*c1 channels
         # Output: c1 channels (residual correction in same space as x_curr)
         self.motion_conv = Conv(c1 * 2, c1, k=1)
-        # Learnable gate: starts nearly closed so early training ≈ standard YOLOv5
-        self.gate = nn.Parameter(torch.tensor([-5.0]))
+        # Learnable gate: starts partially closed so early training is mostly standard YOLOv5
+        # -2.0 → sigmoid ≈ 0.12 (enough gradient signal to learn, not so high as to destabilize)
+        self.gate = nn.Parameter(torch.tensor([-2.0]))
 
     def forward(self, x_curr, x_prev):
         # Cold start: no previous frame available

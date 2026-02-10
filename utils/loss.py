@@ -144,10 +144,18 @@ class ComputeLoss:
                 pbox = torch.cat((pxy, pwh), 1)
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()
 
-                # Trend-Aware weighted box loss (paper Eq. 2)
+                # Trend-Aware weighted box loss (paper Eq. 2-3)
                 lbox_i = (1.0 - iou)
                 w_i = tweights[i]
-                lbox += (lbox_i * w_i).mean()  # weighted mean, no re-normalization
+                # Paper Eq. 3: normalize weights so total loss magnitude is unchanged
+                # ω̂_i = ω_i * Σ L_i^reg / Σ (ω_i * L_i^reg)
+                w_sum = (w_i * lbox_i.detach()).sum()
+                l_sum = lbox_i.detach().sum()
+                if w_sum > 0:
+                    w_hat = w_i * (l_sum / w_sum)
+                else:
+                    w_hat = w_i
+                lbox += (lbox_i * w_hat).mean()
 
                 iou = iou.detach().clamp(0).type(tobj.dtype)
                 if self.sort_obj_iou:

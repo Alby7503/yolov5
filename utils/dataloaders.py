@@ -73,7 +73,7 @@ for orientation in ExifTags.TAGS.keys():
 
 import numpy as np
 
-def calculate_tal_weights(labels_curr, labels_fut, tau=0.3, nu=1.6, scale=1):
+def calculate_tal_weights(labels_curr, labels_fut, tau=0.5, nu=1.6, scale=1):
     if len(labels_fut) == 0:
         return np.array([])
 
@@ -838,8 +838,15 @@ class LoadImagesAndLabels(Dataset):
             labels_curr = self.labels[index].copy()
 
             # 2. Load Future Frame Labels (Target)
-            # Forecsting 2 frames ahead (approx 66ms at 30fps) to lead the target
+            # Forecasting 1 frame ahead to lead the target.
+            # CRITICAL: Only use future frame if it belongs to the same video/zone.
+            # Cross-zone future labels would teach wrong box positions → kills recall.
             future_index = index + 1 if index + 1 < len(self.labels) else index
+            if future_index != index:
+                curr_zone = Path(self.im_files[index]).stem.rsplit('_frame_', 1)[0]
+                fut_zone = Path(self.im_files[future_index]).stem.rsplit('_frame_', 1)[0]
+                if curr_zone != fut_zone:
+                    future_index = index  # stay on current frame at zone boundary
             labels = self.labels[future_index].copy()
 
             # 3. Calculate Velocity Weights (Eq. 1 & 2 from paper)

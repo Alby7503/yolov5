@@ -399,16 +399,21 @@ def train(hyp, opt, device, callbacks):
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # --- STREAMYOLO: Reset DFP buffer at zone boundaries ---
-            if i > 0 and hasattr(de_parallel(model), 'reset_buffer'):
-                # Check if zone changed between this batch and the previous one
-                current_zone = Path(paths[0]).stem.rsplit('_frame_')[0]  # e.g., "zone_02"
-                if hasattr(train_loader, '_prev_zone') and train_loader._prev_zone != current_zone:
+            if hasattr(de_parallel(model), 'reset_buffer'):
+                if i == 0:
+                    # Reset at start of each epoch
                     de_parallel(model).reset_buffer()
-                train_loader._prev_zone = current_zone
-            elif i == 0 and hasattr(de_parallel(model), 'reset_buffer'):
-                de_parallel(model).reset_buffer()  # Reset at start of each epoch
-                if len(paths) > 0:
-                    train_loader._prev_zone = Path(paths[0]).stem.rsplit('_frame_')[0]
+                    if len(paths) > 0:
+                        train_loader._prev_zone = Path(paths[0]).stem.rsplit('_frame_')[0]
+                else:
+                    # Check ALL images in batch for zone changes (not just paths[0])
+                    # A batch spanning two zones corrupts the DFP buffer
+                    batch_zones = set(Path(p).stem.rsplit('_frame_')[0] for p in paths)
+                    current_zone = Path(paths[0]).stem.rsplit('_frame_')[0]
+                    if (hasattr(train_loader, '_prev_zone') and train_loader._prev_zone != current_zone) \
+                            or len(batch_zones) > 1:
+                        de_parallel(model).reset_buffer()
+                    train_loader._prev_zone = Path(paths[-1]).stem.rsplit('_frame_')[0]
 
             # Warmup
             if ni <= nw:
