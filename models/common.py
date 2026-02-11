@@ -106,42 +106,34 @@ class DWConv(Conv):
 
 
 class DFP(nn.Module):
-    """Dual-Flow Perception Module (StreamYOLO Paper Specification).
+    """Dual-Flow Perception Module (StreamYOLO Paper — faithful to official DFPPAFPN).
     
-    The module computes a temporal residual correction from the difference
-    between current and previous features, then gates it onto the current features.
-    This ensures the output stays in the same feature space as x_curr.
+    For each PAN output scale, halves channels of both current and support features
+    via a learned 1×1 conv ('jian'), concatenates them back to original channel count,
+    and adds a residual connection to the current features.
+    
+    Official: pan_out = cat([jian(current), jian(support)], dim=1) + current
+    Cold-start: pan_out = cat([jian(current), jian(current)], dim=1) + current
     """
     def __init__(self, c1):
         super().__init__()
-        # Process the concatenation of current and motion (difference) features
-        # Input: cat(x_curr, x_curr - x_prev) → 2*c1 channels
-        # Output: c1 channels (residual correction in same space as x_curr)
-        self.motion_conv = Conv(c1 * 2, c1, k=1)
-        # Learnable gate: starts partially closed so early training is mostly standard YOLOv5
-        # -2.0 → sigmoid ≈ 0.12 (enough gradient signal to learn, not so high as to destabilize)
-        self.gate = nn.Parameter(torch.tensor([-2.0]))
+        # 'jian' = 1×1 conv that halves channels (same conv applied to both streams)
+        self.jian = Conv(c1, c1 // 2, k=1)
 
-    def forward(self, x_curr, x_prev):
-        # Cold start: no previous frame available
-        if x_prev is None or x_curr.shape != x_prev.shape:
-            return x_curr
+    def forward(self, x_curr, x_support):
+        # Cold start: no support frame available → self-pair (matches official 'star' node)
+        if x_support is None or x_curr.shape != x_support.shape:
+            x_support = x_curr
 
         # Device/dtype safety
-        if x_prev.device != x_curr.device:
-            x_prev = x_prev.to(x_curr.device)
-        if x_prev.dtype != x_curr.dtype:
-            x_prev = x_prev.to(dtype=x_curr.dtype)
+        if x_support.device != x_curr.device:
+            x_support = x_support.to(x_curr.device)
+        if x_support.dtype != x_curr.dtype:
+            x_support = x_support.to(dtype=x_curr.dtype)
 
-        # Motion feature = difference between current and previous
-        x_motion = x_curr - x_prev
-
-        # Fuse current appearance with motion into a residual correction
-        x_residual = self.motion_conv(torch.cat([x_curr, x_motion], dim=1))
-
-        # Gated residual addition (both tensors in same feature space)
-        alpha = torch.sigmoid(self.gate)
-        return x_curr + alpha * x_residual
+        # Official DFP fusion: cat halved features + residual
+        fused = torch.cat([self.jian(x_curr), self.jian(x_support)], dim=1)
+        return fused + x_curr
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):

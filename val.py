@@ -323,7 +323,7 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run("on_val_start")
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, (im, targets, support_targets, paths, shapes) in enumerate(pbar):
         callbacks.run("on_val_batch_start")
         with dt[0]:
             if cuda:
@@ -339,12 +339,12 @@ def run(
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            loss += compute_loss(train_out, targets, support_targets)[1]  # box, obj, cls
 
         # NMS
-        # Scale only the bbox columns (2:6), leaving weight column (6) untouched
+        # Scale only the bbox columns (2:6)
         targets[:, 2:6] *= torch.tensor((width, height, width, height), device=device)  # to pixels
-        lb = [targets[targets[:, 0] == i, 1:6] for i in range(nb)] if save_hybrid else []  # for autolabelling (exclude weight column)
+        lb = [targets[targets[:, 0] == i, 1:6] for i in range(nb)] if save_hybrid else []  # for autolabelling
 
         with dt[2]:
             preds = non_max_suppression(
@@ -353,7 +353,7 @@ def run(
 
         # Metrics
         for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si, 1:6]  # exclude weight column (index 6)
+            labels = targets[targets[:, 0] == si, 1:6]  # [class, x, y, w, h]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
             path, shape = Path(paths[si]), shapes[si][0]
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
@@ -390,10 +390,11 @@ def run(
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
             callbacks.run("on_val_image_end", pred, predn, path, names, im[si])
 
-        # Plot images
+        # Plot images (use only first 3 channels — current frame — for visualization)
         if plots and batch_i < 3:
-            plot_images(im, targets[:, :6], paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)  # labels
-            plot_images(im, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)  # pred
+            im_plot = im[:, :3] if im.shape[1] > 3 else im
+            plot_images(im_plot, targets[:, :6], paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)  # labels
+            plot_images(im_plot, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)  # pred
 
         callbacks.run("on_val_batch_end", batch_i, im, targets, paths, shapes, preds)
 

@@ -306,7 +306,7 @@ def train(hyp, opt, device, callbacks):
         image_weights=opt.image_weights,
         quad=opt.quad,
         prefix=colorstr("train: "),
-        shuffle=False,
+        shuffle=True,
         seed=opt.seed,
     )
     labels = np.concatenate(dataset.labels, 0)
@@ -393,27 +393,14 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, support_targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
-            # --- STREAMYOLO: Reset DFP buffer at zone boundaries ---
-            if hasattr(de_parallel(model), 'reset_buffer'):
-                if i == 0:
-                    # Reset at start of each epoch
-                    de_parallel(model).reset_buffer()
-                    if len(paths) > 0:
-                        train_loader._prev_zone = Path(paths[0]).stem.rsplit('_frame_')[0]
-                else:
-                    # Check ALL images in batch for zone changes (not just paths[0])
-                    # A batch spanning two zones corrupts the DFP buffer
-                    batch_zones = set(Path(p).stem.rsplit('_frame_')[0] for p in paths)
-                    current_zone = Path(paths[0]).stem.rsplit('_frame_')[0]
-                    if (hasattr(train_loader, '_prev_zone') and train_loader._prev_zone != current_zone) \
-                            or len(batch_zones) > 1:
-                        de_parallel(model).reset_buffer()
-                    train_loader._prev_zone = Path(paths[-1]).stem.rsplit('_frame_')[0]
+            # --- STREAMYOLO: During training, 6ch input contains both frames ---
+            # No cross-batch DFP buffer needed (both current + support are in the 6ch input).
+            # Reset buffer only for validation/inference (handled in model forward).
 
             # Warmup
             if ni <= nw:
@@ -437,7 +424,7 @@ def train(hyp, opt, device, callbacks):
             # Forward
             with torch.amp.autocast("cuda"):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                loss, loss_items = compute_loss(pred, targets.to(device), support_targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -671,13 +658,17 @@ def main(opt, callbacks=Callbacks()):
         last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
         opt_yaml = last.parent.parent / "opt.yaml"  # train options yaml
         opt_data = opt.data  # original dataset
+        opt_cfg = opt.cfg   # preserve --cfg from command line
         if opt_yaml.is_file():
             with open(opt_yaml, errors="ignore") as f:
                 d = yaml.safe_load(f)
         else:
             d = torch_load(last, map_location="cpu")["opt"]
         opt = argparse.Namespace(**d)  # replace
-        opt.cfg, opt.weights, opt.resume = "", str(last), True  # reinstate
+        opt.weights, opt.resume = str(last), True  # reinstate
+        # Restore cfg: prefer command-line --cfg, else keep what opt.yaml had
+        if opt_cfg:
+            opt.cfg = opt_cfg
         if is_url(opt_data):
             opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
     else:
