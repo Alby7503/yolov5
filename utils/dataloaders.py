@@ -768,11 +768,18 @@ class LoadImagesAndLabels(Dataset):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
+        # --- STREAMYOLO: Compute next_index for future GT (T+1) ---
+        # Paper: model sees (T, T-1), predicts T+1 GT.  TAL compares T+1 GT vs T GT.
+        # next_index = T+1 if it exists and is in the same zone, else self (T).
+        curr_zone = Path(self.im_files[index]).stem.rsplit('_frame_', 1)[0]
+        next_index = index + 1
+        if next_index >= len(self.im_files) or Path(self.im_files[next_index]).stem.rsplit('_frame_', 1)[0] != curr_zone:
+            next_index = index  # last frame in zone → use own labels (no future available)
+
         if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
-            # Load mosaic (no meaningful support frame for mosaic — self-pair in DFP)
+            # Load mosaic (breaks temporal sequence — self-pair in DFP, no future-prediction)
             img, labels = self.load_mosaic(index)
             shapes = None
-            support_labels = np.zeros((0, 5))  # empty support labels
 
             # MixUp augmentation
             if random.random() < hyp["mixup"]:
@@ -780,6 +787,8 @@ class LoadImagesAndLabels(Dataset):
             
             # For mosaic: duplicate image as support (self-pair → DFP identity via residual)
             support_img = img.copy()
+            # Mosaic mixes random frames → cannot do future-prediction, keep mosaic labels as-is
+            support_labels = np.zeros((0, 5))  # empty → TAL weight = 1.0
 
         else:
             # Load current frame image
@@ -794,7 +803,6 @@ class LoadImagesAndLabels(Dataset):
             # Support = previous frame in the same zone (for DFP dual-flow)
             support_index = index - 1 if index - 1 >= 0 else index
             if support_index != index:
-                curr_zone = Path(self.im_files[index]).stem.rsplit('_frame_', 1)[0]
                 supp_zone = Path(self.im_files[support_index]).stem.rsplit('_frame_', 1)[0]
                 if curr_zone != supp_zone:
                     support_index = index  # no valid previous frame → self-pair
@@ -802,11 +810,11 @@ class LoadImagesAndLabels(Dataset):
             support_img, _, (sh, sw) = self.load_image(support_index)
             support_img, _, _ = letterbox(support_img, shape, auto=False, scaleup=self.augment)
 
-            # --- CURRENT frame labels (training TARGET) ---
-            labels = self.labels[index].copy()
+            # --- FUTURE frame labels T+1 (training TARGET — paper's scheme) ---
+            labels = self.labels[next_index].copy()
 
-            # --- SUPPORT frame labels (for TAL weighting in loss) ---
-            support_labels = self.labels[support_index].copy()
+            # --- CURRENT frame labels T (for TAL weighting in loss) ---
+            support_labels = self.labels[index].copy()
 
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])

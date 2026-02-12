@@ -110,8 +110,8 @@ class ComputeLoss:
 
     # StreamYOLO TAL parameters (s-model values from paper)
     tal_gamma = 1.0
-    tal_ignore_thr = 0.5
-    tal_ignore_value = 1.5
+    tau = 0.5
+    nu = 1.5
 
     def __init__(self, model, autobalance=False):
         device = next(model.parameters()).device
@@ -138,8 +138,14 @@ class ComputeLoss:
         For each target box, find the best IoU with any support-frame GT box
         (same image index, any class). Then:
             weight = 1 / (best_iou ^ gamma)
-        If best_iou > ignore_thr: weight = ignore_value  (nearly-static objects)
+        If best_iou < ignore_thr: weight = ignore_value  (fast-moving objects, cap weight)
         If no support boxes for that image: weight = 1.0  (no temporal info)
+
+        This matches the paper's TALHead.get_losses():
+            ious, _ = max(pair_iou, dim=1)   # best match per GT
+            filter_id = (ious < ignore_thr)  # low IoU = moved a lot
+            ious[filter_id] = ignore_value   # cap the raw IoU used for weighting
+            weight = 1 / (ious ^ gamma)
 
         Args:
             targets: [N, 6] tensor — [img_idx, class, x, y, w, h] (normalized xywh)
@@ -180,10 +186,6 @@ class ComputeLoss:
             s_xyxy[:, 3] = s_boxes[:, 1] + s_boxes[:, 3] / 2
 
             # Pairwise IoU: [nt, ns]
-            nt_boxes = t_xyxy.shape[0]
-            ns_boxes = s_xyxy.shape[0]
-
-            # Broadcast intersection
             inter_x1 = torch.max(t_xyxy[:, 0:1], s_xyxy[:, 0:1].T)  # [nt, ns]
             inter_y1 = torch.max(t_xyxy[:, 1:2], s_xyxy[:, 1:2].T)
             inter_x2 = torch.min(t_xyxy[:, 2:3], s_xyxy[:, 2:3].T)
@@ -198,11 +200,12 @@ class ComputeLoss:
 
             best_iou, _ = iou_matrix.max(dim=1)  # [nt] — best match per target box
 
+            # Paper: low IoU = fast-moving → cap the raw IoU at ignore_value
+            # so the weight doesn't explode for very fast objects
+            best_iou[best_iou < self.tau] = self.nu
+
             # TAL weight: 1 / (iou ^ gamma)
             w = 1.0 / (best_iou.clamp(min=1e-7) ** self.tal_gamma)
-
-            # Override high-IoU (nearly-static) objects with ignore_value
-            w[best_iou > self.tal_ignore_thr] = self.tal_ignore_value
 
             weights[t_mask] = w
 
