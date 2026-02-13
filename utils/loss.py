@@ -215,7 +215,7 @@ class ComputeLoss:
         lcls = torch.zeros(1, device=self.device)
         lbox = torch.zeros(1, device=self.device)
         lobj = torch.zeros(1, device=self.device)
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)
+        tcls, tbox, indices, anchors, gt_indices = self.build_targets(p, targets)
 
         # --- TAL weights: computed per-GT from support frame IoU ---
         if support_targets is not None and support_targets.shape[0] > 0:
@@ -236,7 +236,7 @@ class ComputeLoss:
 
                 # Trend-Aware weighted box loss (paper Eq. 2-3)
                 lbox_i = (1.0 - iou)
-                w_i = self._get_matched_tal_weights(b, targets, gt_tal_weights, i)
+                w_i = self._get_matched_tal_weights(gt_indices[i], gt_tal_weights)
                 # Paper Eq. 3: normalize weights so total loss magnitude is unchanged
                 # ω̂_i = ω_i * Σ L_i^reg / Σ (ω_i * L_i^reg)
                 w_sum = (w_i * lbox_i.detach()).sum()
@@ -274,46 +274,38 @@ class ComputeLoss:
 
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
 
-    def _get_matched_tal_weights(self, b_indices, targets, gt_tal_weights, layer_idx):
-        """Map per-GT TAL weights to the expanded set of matched predictions.
+    def _get_matched_tal_weights(self, matched_gt_idx, gt_tal_weights):
+        """Map per-GT TAL weights to expanded matches using exact GT indices.
 
-        build_targets expands GTs across anchors and neighboring grid cells.
-        We need to map each expanded match back to its original GT to get the TAL weight.
-        Since we don't have a direct index, we use the image index as a rough mapping —
-        but for correctness we return per-image average TAL weight.
+        Args:
+            matched_gt_idx: [K] long tensor with original GT row index for each matched positive.
+            gt_tal_weights: [N] TAL weight per original GT row.
 
-        A simpler but effective approach: each matched prediction at (b, a, gj, gi)
-        came from a GT in image b[k]. We take the average TAL weight of all GTs
-        in that image. This is an approximation but works well in practice since
-        most images have similar-motion objects.
+        Returns:
+            [K] TAL weights aligned with matched predictions.
         """
-        n = b_indices.shape[0]
+        n = matched_gt_idx.shape[0]
         if n == 0:
             return torch.ones(0, device=self.device)
 
-        weights = torch.ones(n, device=self.device)
-        for img_i in b_indices.unique():
-            mask = b_indices == img_i
-            gt_mask = targets[:, 0].long() == img_i.long()
-            if gt_mask.any():
-                avg_w = gt_tal_weights[gt_mask].mean()
-                weights[mask] = avg_w
-        return weights
+        return gt_tal_weights[matched_gt_idx.long()]
 
     def build_targets(self, p, targets):
         """Standard YOLOv5 build_targets with 6-column labels [img_idx, class, x, y, w, h]."""
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        tcls, tbox, indices, anch = [], [], [], []
+        tcls, tbox, indices, anch, gt_idx_out = [], [], [], [], []
         gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
+        ti = torch.arange(nt, device=self.device).float().view(1, nt).repeat(na, 1)
+        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None], ti[..., None]), 2)  # + anchor and gt index
 
         g = 0.5  # bias
         off = torch.tensor([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1]], device=self.device).float() * g  # offsets
 
         for i in range(self.nl):
             anchors, shape = self.anchors[i], p[i].shape
-            gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
+            gain = torch.ones(8, device=self.device)
+            gain[2:6] = torch.tensor(shape, device=self.device)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
             t = targets * gain
@@ -344,9 +336,11 @@ class ComputeLoss:
 
             # Append
             a = t[:, 6].long()  # anchor indices
+            gt_idx = t[:, 7].long()  # original GT row indices
             indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, grid
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
+            gt_idx_out.append(gt_idx)
 
-        return tcls, tbox, indices, anch
+        return tcls, tbox, indices, anch, gt_idx_out
