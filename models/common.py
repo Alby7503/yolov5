@@ -120,7 +120,7 @@ class DFP(nn.Module):
         # 'jian' = 1×1 conv that halves channels (same conv applied to both streams)
         self.jian = Conv(c1, c1 // 2, k=1)
 
-    def forward(self, x_curr, x_support):
+    def forward(self, x_curr : torch.Tensor, x_support : torch.Tensor):
         # Cold start: no support frame available → self-pair (matches official 'star' node)
         if x_support is None or x_curr.shape != x_support.shape:
             x_support = x_curr

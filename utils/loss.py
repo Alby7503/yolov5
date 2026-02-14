@@ -111,7 +111,7 @@ class ComputeLoss:
     # StreamYOLO TAL parameters (s-model values from paper)
     tal_gamma = 1.0
     tau = 0.5
-    nu = 1.5
+    nu = 1.6
 
     def __init__(self, model, autobalance=False):
         device = next(model.parameters()).device
@@ -133,23 +133,23 @@ class ComputeLoss:
         self.device = device
 
     def _compute_tal_weights(self, targets, support_targets):
-        """Compute Trend-Aware Learning (TAL) weights per target GT box.
+        """Compute Trend-Aware Learning (TAL) weights per target GT box (paper Eq. 1-2).
 
-        For each target box, find the best IoU with any support-frame GT box
-        (same image index, any class). Then:
-            weight = 1 / (best_iou ^ gamma)
-        If best_iou < ignore_thr: weight = ignore_value  (fast-moving objects, cap weight)
-        If no support boxes for that image: weight = 1.0  (no temporal info)
+        Paper convention:
+            targets       = G_{t+1}  — next-frame GT (what the model predicts)
+            support_targets = G_t    — current-frame GT (reference for motion)
 
-        This matches the paper's TALHead.get_losses():
-            ious, _ = max(pair_iou, dim=1)   # best match per GT
-            filter_id = (ious < ignore_thr)  # low IoU = moved a lot
-            ious[filter_id] = ignore_value   # cap the raw IoU used for weighting
-            weight = 1 / (ious ^ gamma)
+        For each target box in G_{t+1}, find the best IoU with any G_t box
+        in the same image (paper Eq. 1):
+            mIoU_i = max_j { IoU(box_i^{t+1}, box_j^t) }
+
+        Then apply paper Eq. 2:
+            ω_i = 1 / mIoU_i^γ   if mIoU_i >= τ   (slow-moving objects)
+            ω_i = 1 / ν           if mIoU_i < τ    (fast-moving / new objects)
 
         Args:
-            targets: [N, 6] tensor — [img_idx, class, x, y, w, h] (normalized xywh)
-            support_targets: [M, 6] tensor — same format for support frame
+            targets: [N, 6] tensor — [img_idx, class, x, y, w, h] (G_{t+1} labels)
+            support_targets: [M, 6] tensor — same format (G_t labels)
 
         Returns:
             weights: [N] tensor of per-GT TAL weights
@@ -200,12 +200,13 @@ class ComputeLoss:
 
             best_iou, _ = iou_matrix.max(dim=1)  # [nt] — best match per target box
 
-            # Paper: low IoU = fast-moving → cap the raw IoU at ignore_value
-            # so the weight doesn't explode for very fast objects
-            best_iou[best_iou < self.tau] = self.nu
-
-            # TAL weight: 1 / (iou ^ gamma)
-            w = 1.0 / (best_iou.clamp(min=1e-7) ** self.tal_gamma)
+            # Paper Eq. 2 (exact):
+            #   ω_i = 1 / mIoU_i^γ   if mIoU_i >= τ
+            #   ω_i = 1 / ν           if mIoU_i <  τ   (fast-moving / new objects)
+            w = torch.empty_like(best_iou)
+            matched = best_iou >= self.tau
+            w[matched] = 1.0 / (best_iou[matched].clamp(min=1e-7) ** self.tal_gamma)
+            w[~matched] = 1.0 / self.nu
 
             weights[t_mask] = w
 
