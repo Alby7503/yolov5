@@ -765,16 +765,15 @@ class LoadImagesAndLabels(Dataset):
 
     def __getitem__(self, index):
         """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
-        index = self.indices[index]  # linear, shuffled, or image_weights
+        index = self.indices[index]
 
         hyp = self.hyp
-        # --- STREAMYOLO: Compute next_index for future GT (T+1) ---
-        # Paper: model sees (T, T-1), predicts T+1 GT.  TAL compares T+1 GT vs T GT.
-        # next_index = T+1 if it exists and is in the same zone, else self (T).
-        curr_zone = Path(self.im_files[index]).stem.rsplit('_frame_', 1)[0]
+
+        # next_index = T+1 if it exists and is in the same zone, else next_index = T.
+        current_video = Path(self.im_files[index]).stem.rsplit('_frame_', 1)[0]
         next_index = index + 1
-        if next_index >= len(self.im_files) or Path(self.im_files[next_index]).stem.rsplit('_frame_', 1)[0] != curr_zone:
-            next_index = index  # last frame in zone → use own labels (no future available)
+        if next_index >= len(self.im_files) or Path(self.im_files[next_index]).stem.rsplit('_frame_', 1)[0] != current_video:
+            next_index = index 
 
         if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
             # Load mosaic (breaks temporal sequence — self-pair in DFP, no future-prediction)
@@ -785,11 +784,8 @@ class LoadImagesAndLabels(Dataset):
             if random.random() < hyp["mixup"]:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
             
-            # For mosaic: duplicate image as support (self-pair → DFP identity via residual)
             support_img = img.copy()
-            # Mosaic mixes random frames → cannot do future-prediction, keep mosaic labels as-is
-            support_labels = np.zeros((0, 5))  # empty → TAL weight = 1.0
-
+            support_labels = np.zeros((0, 5))
         else:
             # Load current frame image
             img, (h0, w0), (h, w) = self.load_image(index)
@@ -797,23 +793,22 @@ class LoadImagesAndLabels(Dataset):
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            shapes = (h0, w0), ((h / h0, w / w0), pad)
 
-            # --- STREAMYOLO: Load support (previous) frame image ---
-            # Support = previous frame in the same zone (for DFP dual-flow)
+            # Support = previous frame in the same video (for DFP dual-flow)
             support_index = index - 1 if index - 1 >= 0 else index
             if support_index != index:
-                supp_zone = Path(self.im_files[support_index]).stem.rsplit('_frame_', 1)[0]
-                if curr_zone != supp_zone:
-                    support_index = index  # no valid previous frame → self-pair
+                supp_video = Path(self.im_files[support_index]).stem.rsplit('_frame_', 1)[0]
+                if current_video != supp_video:
+                    support_index = index  # no valid previous frame, use current frame as support
             
             support_img, _, (sh, sw) = self.load_image(support_index)
             support_img, _, _ = letterbox(support_img, shape, auto=False, scaleup=self.augment)
 
-            # --- FUTURE frame labels T+1 (training TARGET — paper's scheme) ---
+            #Future frame labels T+1
             labels = self.labels[next_index].copy()
 
-            # --- CURRENT frame labels T (for TAL weighting in loss) ---
+            #Current frame labels T
             support_labels = self.labels[index].copy()
 
             if labels.size:
@@ -829,16 +824,12 @@ class LoadImagesAndLabels(Dataset):
                     shear=hyp["shear"],
                     perspective=hyp["perspective"],
                 )
-                # Apply same flip augmentations to support image for consistency
-                # (random_perspective uses random state so we can't perfectly sync,
-                # but flips are applied after and we can sync those)
-
         nl = len(labels)  # number of labels
         if nl:
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
         if self.augment:
-            # HSV color-space augmentation (apply to both current and support)
+            # HSV color-space augmentation
             augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
             augment_hsv(support_img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
@@ -849,26 +840,22 @@ class LoadImagesAndLabels(Dataset):
                 if nl:
                     labels[:, 2] = 1 - labels[:, 2]
 
-            # Flip left-right (sync both frames — paper uses flip=True)
             if random.random() < hyp["fliplr"]:
                 img = np.fliplr(img)
                 support_img = np.fliplr(support_img)
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
-
-        # --- FINAL OUTPUT: 6-channel image (current + support) ---
-        # Standard labels: [img_index, class, x, y, w, h] (6 cols, no weight column)
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Support labels: [img_index, class, x, y, w, h] (for TAL weighting in loss)
+        # Support labels: [img_index, class, x, y, w, h]
         n_supp = len(support_labels) if support_labels.size else 0
         support_labels_out = torch.zeros((n_supp, 6))
         if n_supp:
             support_labels_out[:, 1:] = torch.from_numpy(support_labels)
 
-        # Concatenate current + support images → 6 channels for DFP
+        # Concatenate current + support images
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
         support_img = support_img.transpose((2, 0, 1))[::-1]
