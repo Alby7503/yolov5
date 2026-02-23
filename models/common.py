@@ -106,14 +106,15 @@ class DWConv(Conv):
 
 
 class DFP(nn.Module):
-    """Dual-Flow Perception Module (StreamYOLO Paper — faithful to official DFPPAFPN).
+    """Dual-Flow Perception Module (StreamYOLO Paper).
     
-    For each PAN output scale, halves channels of both current and support features
-    via a learned 1×1 conv ('jian'), concatenates them back to original channel count,
-    and adds a residual connection to the current features.
+    Per ogni scala di output PAN, dimezza i canali sia delle caratteristiche correnti,
+    che di supporto tramite una convoluzione 1×1 appresa ('jian'),
+    le concatena tornando al numero originale di canali,
+    e aggiunge una connessione residua alle caratteristiche correnti.
     
-    Official: pan_out = cat([jian(current), jian(support)], dim=1) + current
-    Cold-start: pan_out = cat([jian(current), jian(current)], dim=1) + current
+    Ufficiale: pan_out = cat([jian(corrente), jian(support)], dim=1) + corrente
+    Primo avvio: pan_out = cat([jian(corrente), jian(corrente)], dim=1) + corrente
     """
     def __init__(self, c1):
         super().__init__()

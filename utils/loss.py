@@ -133,26 +133,26 @@ class ComputeLoss:
         self.device = device
 
     def _compute_tal_weights(self, targets, support_targets):
-        """Compute Trend-Aware Learning (TAL) weights per target GT box (paper Eq. 1-2).
+        """        Calcola i pesi Trend-Aware Learning (TAL) per ogni box GT target, confrontando con le box GT di supporto del frame precedente.
 
-        Paper convention:
-            targets       = G_{t+1}  — next-frame GT (what the model predicts)
-            support_targets = G_t    — current-frame GT (reference for motion)
+        Convenzioni del paper:
+            targets       = G_{t+1}  — GT del frame successivo (cosa il modello predice)
+            support_targets = G_t    — GT del frame corrente (riferimento per il movimento)
 
-        For each target box in G_{t+1}, find the best IoU with any G_t box
-        in the same image (paper Eq. 1):
+        Per ogni box target in G_{t+1}, trova la migliore IoU con qualsiasi box in G_t
+        nello stesso frame (paper Eq. 1):
             mIoU_i = max_j { IoU(box_i^{t+1}, box_j^t) }
-
-        Then apply paper Eq. 2:
-            ω_i = 1 / mIoU_i^γ   if mIoU_i >= τ   (slow-moving objects)
-            ω_i = 1 / ν           if mIoU_i < τ    (fast-moving / new objects)
-
+            
+        Poi normalizza i pesi in base alla velocità rilevata dell'oggetto (paper Eq. 3):
+            ω_i = 1 / mIoU_i^γ   if mIoU_i >= τ   (oggetti lenti)
+            ω_i = 1 / ν           if mIoU_i < τ    (oggetti veloci / nuovi)
+            
         Args:
             targets: [N, 6] tensor — [img_idx, class, x, y, w, h] (G_{t+1} labels)
-            support_targets: [M, 6] tensor — same format (G_t labels)
+            support_targets: [M, 6] tensor — stesso formato (G_t labels)
 
         Returns:
-            weights: [N] tensor of per-GT TAL weights
+            weights: [N] tensor di pesi TAL per ogni box GT in `targets`, calcolati confrontando con `support_targets` del frame precedente.
         """
         n = targets.shape[0]
         weights = torch.ones(n, device=self.device)
@@ -161,16 +161,16 @@ class ComputeLoss:
             return weights
 
         for img_i in targets[:, 0].unique().long():
-            # Masks for this image
+            # Maschere per questa immagine
             t_mask = targets[:, 0].long() == img_i
             s_mask = support_targets[:, 0].long() == img_i
 
             if not s_mask.any():
-                continue  # no support boxes → weight stays 1.0
+                continue  # nessuna box di supporto → il peso rimane 1.0
 
-            # Get boxes in xywh format, convert to xyxy for IoU
-            t_boxes = targets[t_mask, 2:6]  # [nt, 4] normalized xywh
-            s_boxes = support_targets[s_mask, 2:6]  # [ns, 4] normalized xywh
+            # Ottieni le box in formato xywh, converti in xyxy per IoU
+            t_boxes = targets[t_mask, 2:6]  # [nt, 4] xywh normalizzati
+            s_boxes = support_targets[s_mask, 2:6]  # [ns, 4] xywh normalizzati
 
             # xywh to xyxy
             t_xyxy = torch.zeros_like(t_boxes)
@@ -198,11 +198,11 @@ class ComputeLoss:
             union = t_area[:, None] + s_area[None, :] - inter_area
             iou_matrix = inter_area / (union + 1e-7)  # [nt, ns]
 
-            best_iou, _ = iou_matrix.max(dim=1)  # [nt] — best match per target box
+            best_iou, _ = iou_matrix.max(dim=1)  # [nt] — miglior IoU per ogni box target con qualsiasi box di supporto
 
-            # Paper Eq. 2 (exact):
+            # Paper Eq. 2:
             #   ω_i = 1 / mIoU_i^γ   if mIoU_i >= τ
-            #   ω_i = 1 / ν           if mIoU_i <  τ   (fast-moving / new objects)
+            #   ω_i = 1 / ν           if mIoU_i <  τ   (oggetti veloci / nuovi)
             w = torch.empty_like(best_iou)
             matched = best_iou >= self.tau
             w[matched] = 1.0 / (best_iou[matched].clamp(min=1e-7) ** self.tal_gamma)
@@ -218,7 +218,7 @@ class ComputeLoss:
         lobj = torch.zeros(1, device=self.device)
         tcls, tbox, indices, anchors, gt_indices = self.build_targets(p, targets)
 
-        # --- TAL weights: computed per-GT from support frame IoU ---
+        # Pesi TAL: calcolati per ogni box GT target confrontando con le box GT di supporto del frame precedente, mappati a ogni predizione positiva tramite gli indici GT originali.
         if support_targets is not None and support_targets.shape[0] > 0:
             gt_tal_weights = self._compute_tal_weights(targets, support_targets)
         else:
@@ -235,10 +235,10 @@ class ComputeLoss:
                 pbox = torch.cat((pxy, pwh), 1)
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()
 
-                # Trend-Aware weighted box loss (paper Eq. 2-3)
+                # Box loss pesato con loss Trend-Aware
                 lbox_i = (1.0 - iou)
                 w_i = self._get_matched_tal_weights(gt_indices[i], gt_tal_weights)
-                # Paper Eq. 3: normalize weights so total loss magnitude is unchanged
+                # Normalizza i pesi TAL in modo che la somma dei pesi moltiplicata per la somma delle loss individuali sia uguale alla somma delle loss individuali senza pesi:
                 # ω̂_i = ω_i * Σ L_i^reg / Σ (ω_i * L_i^reg)
                 w_sum = (w_i * lbox_i.detach()).sum()
                 l_sum = lbox_i.detach().sum()
@@ -276,14 +276,14 @@ class ComputeLoss:
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
 
     def _get_matched_tal_weights(self, matched_gt_idx, gt_tal_weights):
-        """Map per-GT TAL weights to expanded matches using exact GT indices.
+        """Mappa i pesi TAL per ogni GT ai match espansi utilizzando gli indici esatti delle GT.
 
-        Args:
-            matched_gt_idx: [K] long tensor with original GT row index for each matched positive.
-            gt_tal_weights: [N] TAL weight per original GT row.
+        Argomenti:
+            matched_gt_idx: Tensor di tipo long [K] contenente l'indice di riga originale della GT per ogni elemento positivo matched.
+            gt_tal_weights: Pesi TAL [N] per ogni riga originale delle GT.
 
-        Returns:
-            [K] TAL weights aligned with matched predictions.
+        Restituisce:
+            Pesi TAL [K] allineati con le predizioni matched.
         """
         n = matched_gt_idx.shape[0]
         if n == 0:

@@ -41,7 +41,7 @@ from models.common import (
     Conv,
     CrossConv,
     DetectMultiBackend,
-    DFP,    # StreamYOLO DFP Module
+    DFP,
     DWConv,
     DWConvTranspose2d,
     Expand,
