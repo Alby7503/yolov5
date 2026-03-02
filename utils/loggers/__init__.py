@@ -198,7 +198,9 @@ class Loggers:
         if self.plots:
             if ni < 3:
                 f = self.save_dir / f"train_batch{ni}.jpg"  # filename
-                plot_images(imgs, targets, paths, f)
+                # Use only first 3 channels (current frame) for visualization if 6ch StreamYOLO input
+                imgs_plot = imgs[:, :3] if imgs.shape[1] > 3 else imgs
+                plot_images(imgs_plot, targets, paths, f)
                 if ni == 0 and self.tb and not self.opt.sync_bn:
                     log_tensorboard_graph(self.tb, model, imgsz=(self.opt.imgsz, self.opt.imgsz))
             if ni == 10 and (self.wandb or self.clearml):
@@ -458,6 +460,8 @@ def log_tensorboard_graph(tb, model, imgsz=(640, 640)):
     try:
         p = next(model.parameters())  # for device, type
         imgsz = (imgsz, imgsz) if isinstance(imgsz, int) else imgsz  # expand
+        # Use 3ch input for graph tracing (inference/buffer mode).
+        # DFP models handle 3ch via Case 2 (buffered inference path).
         im = torch.zeros((1, 3, *imgsz)).to(p.device).type_as(p)  # input image (WARNING: must be zeros, not empty)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # suppress jit trace warning

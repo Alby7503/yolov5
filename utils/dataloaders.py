@@ -73,55 +73,6 @@ for orientation in ExifTags.TAGS.keys():
 
 import numpy as np
 
-def calculate_tal_weights(labels_curr, labels_fut, tau=0.25, nu=2, scale=1.3):
-    if len(labels_fut) == 0:
-        return np.array([])
-
-    weights = np.ones((len(labels_fut), 1))
-
-    noise_weight = 1.0 / nu
-
-    if len(labels_curr) > 0:
-        for i, fut_box in enumerate(labels_fut):
-            cls_fut = fut_box[0]
-            curr_candidates = labels_curr[labels_curr[:, 0] == cls_fut]
-
-            if len(curr_candidates) > 0:
-                # Future Box (Inflated)
-                w1, h1 = fut_box[3] * scale, fut_box[4] * scale
-                b1_x1, b1_x2 = fut_box[1] - w1/2, fut_box[1] + w1/2
-                b1_y1, b1_y2 = fut_box[2] - h1/2, fut_box[2] + h1/2
-
-                # Current Candidates (Inflated)
-                w2, h2 = curr_candidates[:, 3] * scale, curr_candidates[:, 4] * scale
-                b2_x1 = curr_candidates[:, 1] - w2/2
-                b2_x2 = curr_candidates[:, 1] + w2/2
-                b2_y1 = curr_candidates[:, 2] - h2/2
-                b2_y2 = curr_candidates[:, 2] + h2/2
-
-                inter_x1 = np.maximum(b1_x1, b2_x1)
-                inter_y1 = np.maximum(b1_y1, b2_y1)
-                inter_x2 = np.minimum(b1_x2, b2_x2)
-                inter_y2 = np.minimum(b1_y2, b2_y2)
-
-                inter_area = np.maximum(0, inter_x2 - inter_x1) * np.maximum(0, inter_y2 - inter_y1)
-                b1_area = w1 * h1
-                b2_area = w2 * h2
-                union = b1_area + b2_area - inter_area
-                ious = inter_area / (union + 1e-6)
-
-                m_iou = np.max(ious) if len(ious) > 0 else 0.0
-
-                if m_iou >= tau:
-                    w = 1.0 / (m_iou + 1e-4) # 1e-4 per evitare division by zero
-                    weights[i] = min(w, 4.0)
-                else:
-                    weights[i] = noise_weight     # Low weight for noise
-            else:
-                weights[i] = noise_weight
-
-    return weights
-
 def get_hash(paths):
     """Generates a single SHA256 hash for a list of file or directory paths by combining their sizes and paths."""
     size = sum(os.path.getsize(p) for p in paths if os.path.exists(p))  # sizes
@@ -814,55 +765,56 @@ class LoadImagesAndLabels(Dataset):
 
     def __getitem__(self, index):
         """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
-        index = self.indices[index]  # linear, shuffled, or image_weights
+        index = self.indices[index]
 
         hyp = self.hyp
+
+        # next_index = T+1 if it exists and is in the same zone, else next_index = T.
+        current_video = Path(self.im_files[index]).stem.rsplit('_frame_', 1)[0]
+        next_index = index + 1
+        if next_index >= len(self.im_files) or Path(self.im_files[next_index]).stem.rsplit('_frame_', 1)[0] != current_video:
+            next_index = index 
+
         if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
-            # Load mosaic
+            # Load mosaic (breaks temporal sequence — self-pair in DFP, no future-prediction)
             img, labels = self.load_mosaic(index)
             shapes = None
 
             # MixUp augmentation
             if random.random() < hyp["mixup"]:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
-
+            
+            support_img = img.copy()
+            support_labels = np.zeros((0, 5))
         else:
-            # Load image
+            # Load current frame image
             img, (h0, w0), (h, w) = self.load_image(index)
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            shapes = (h0, w0), ((h / h0, w / w0), pad)
 
-            # --- TREND-AWARE LOSS LOGIC START ---
+            # Support = previous frame in the same video (for DFP dual-flow)
+            support_index = index - 1 if index - 1 >= 0 else index
+            if support_index != index:
+                supp_video = Path(self.im_files[support_index]).stem.rsplit('_frame_', 1)[0]
+                if current_video != supp_video:
+                    support_index = index  # no valid previous frame, use current frame as support
             
-            # 1. Load Current Frame Labels (for velocity calculation)
-            labels_curr = self.labels[index].copy()
+            support_img, _, (sh, sw) = self.load_image(support_index)
+            support_img, _, _ = letterbox(support_img, shape, auto=False, scaleup=self.augment)
 
-            # 2. Load Future Frame Labels (Target)
-            # Forecsting 2 frames ahead (approx 66ms at 30fps) to lead the target
-            future_index = index + 1 if index + 1 < len(self.labels) else index
-            labels = self.labels[future_index].copy()
+            #Future frame labels T+1
+            labels = self.labels[next_index].copy()
 
-            # 3. Calculate Velocity Weights (Eq. 1 & 2 from paper)
-            # This returns a (N, 1) array of weights
-            weights = calculate_tal_weights(labels_curr, labels)
+            #Current frame labels T
+            support_labels = self.labels[index].copy()
 
-            # 4. Append Weights to Labels
-            # labels becomes [N, 6] -> [class, x, y, w, h, velocity_weight]
             if labels.size:
-                labels = np.hstack((labels, weights))
-                
-                # 5. Transform normalized xywh to pixel xyxy
-                # Change slice from [:, 1:] to [:, 1:5] to only touch coords
-                labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
-            
-            # --- TREND-AWARE LOSS LOGIC END ---
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
             if self.augment:
-                # random_perspective will carry the 6th column (weights) 
-                # along with the boxes, keeping them matched even if boxes are cropped.
                 img, labels = random_perspective(
                     img,
                     labels,
@@ -872,49 +824,45 @@ class LoadImagesAndLabels(Dataset):
                     shear=hyp["shear"],
                     perspective=hyp["perspective"],
                 )
-
         nl = len(labels)  # number of labels
         if nl:
-            # Convert pixel xyxy back to normalized xywh
-            # Slice [:, 1:5] to preserve the weight column at index 5
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
         if self.augment:
-            # Albumentations
-            # Commented out because standard Albumentations might crash 
-            # when receiving 6 columns (it expects 5). 
-            # img, labels = self.albumentations(img, labels)
-            # nl = len(labels)  # update after albumentations
-
-            # HSV color-space
+            # HSV color-space augmentation
             augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+            augment_hsv(support_img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
-            # Flip up-down
+            # Flip up-down (sync both frames)
             if random.random() < hyp["flipud"]:
                 img = np.flipud(img)
+                support_img = np.flipud(support_img)
                 if nl:
                     labels[:, 2] = 1 - labels[:, 2]
 
-            # Flip left-right
             if random.random() < hyp["fliplr"]:
                 img = np.fliplr(img)
+                support_img = np.fliplr(support_img)
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
-
-        # --- FINAL OUTPUT FORMATTING (CRITICAL CHANGE) ---
-        # Standard YOLOv5 uses 6 columns: [img_index, class, x, y, w, h]
-        # We need 7 columns: [img_index, class, x, y, w, h, velocity_weight]
-        
-        labels_out = torch.zeros((nl, 7)) # <--- CHANGED FROM 6 TO 7
+        labels_out = torch.zeros((nl, 6))
         if nl:
-            # Assign our [N, 6] labels to the last 6 columns of labels_out
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Convert
+        # Support labels: [img_index, class, x, y, w, h]
+        n_supp = len(support_labels) if support_labels.size else 0
+        support_labels_out = torch.zeros((n_supp, 6))
+        if n_supp:
+            support_labels_out[:, 1:] = torch.from_numpy(support_labels)
+
+        # Concatenate current + support images
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
+        support_img = support_img.transpose((2, 0, 1))[::-1]
+        support_img = np.ascontiguousarray(support_img)
+        img6ch = np.concatenate([img, support_img], axis=0)  # (6, H, W)
 
-        return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+        return torch.from_numpy(img6ch), labels_out, support_labels_out, self.im_files[index], shapes
 
     def load_image(self, i):
         """Loads an image by index, returning the image, its original dimensions, and resized dimensions.
@@ -1089,39 +1037,52 @@ class LoadImagesAndLabels(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Batches images, labels, paths, and shapes, assigning unique indices to targets in merged label tensor."""
-        im, label, path, shapes = zip(*batch)  # transposed
+        """Collates 6ch images, labels, support_labels, paths and shapes into batches for StreamYOLO."""
+        im, label, support_label, path, shapes = zip(*batch)  # transposed (5-tuple)
         for i, lb in enumerate(label):
             lb[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(im, 0), torch.cat(label, 0), path, shapes
+        for i, slb in enumerate(support_label):
+            slb[:, 0] = i  # add target image index for TAL weighting
+        return torch.stack(im, 0), torch.cat(label, 0), torch.cat(support_label, 0), path, shapes
 
     @staticmethod
     def collate_fn4(batch):
-        """Bundles a batch's data by quartering the number of shapes and paths, preparing it for model input."""
-        im, label, path, shapes = zip(*batch)  # transposed
+        """Collates images into 4-image mosaics, adjusts labels and shapes for quad-batch processing."""
+        im, label, support_label, path, shapes = zip(*batch)  # transposed (5-tuple)
         n = len(shapes) // 4
         im4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
+        # Standard 6-column labels: [img_idx, class, x, y, w, h]
         ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
         wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
-        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
-        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])
+
+        for i in range(n):  # zidane torch.zeros(16, 3, 720, 1280)  # BCHW
             i *= 4
             if random.random() < 0.5:
-                im1 = F.interpolate(im[i].unsqueeze(0).float(), scale_factor=2.0, mode="bilinear", align_corners=False)[
-                    0
-                ].type(im[i].type())
-                lb = label[i]
-            else:
                 im1 = torch.cat((torch.cat((im[i], im[i + 1]), 1), torch.cat((im[i + 2], im[i + 3]), 1)), 2)
                 lb = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
+            else:
+                im1 = torch.cat((torch.cat((im[i], im[i + 1]), 2), torch.cat((im[i + 2], im[i + 3]), 2)), 1)
+                lb = torch.cat((label[i], label[i + 1] + wo, label[i + 2] + ho, label[i + 3] + ho + wo), 0) * s
             im4.append(im1)
             label4.append(lb)
 
         for i, lb in enumerate(label4):
             lb[:, 0] = i  # add target image index for build_targets()
 
-        return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
+        # Support labels: just concat as-is (no spatial transform needed, used only for IoU in loss)
+        support_label4 = []
+        for i in range(n):
+            idx = i * 4
+            slbs = []
+            for j in range(4):
+                sl = support_label[idx + j].clone()
+                sl[:, 0] = i  # remap image index
+                slbs.append(sl)
+            support_label4.append(torch.cat(slbs, 0))
+
+        return torch.stack(im4, 0), torch.cat(label4, 0), torch.cat(support_label4, 0), path4, shapes4
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------

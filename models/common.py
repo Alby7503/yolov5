@@ -104,34 +104,37 @@ class DWConv(Conv):
         """
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
 
-# --- ADD TO models/common.py ---
-
 
 class DFP(nn.Module):
-    # Dual-Flow Perception Module
+    """Dual-Flow Perception Module (StreamYOLO Paper).
+    
+    Per ogni scala di output PAN, dimezza i canali sia delle caratteristiche correnti,
+    che di supporto tramite una convoluzione 1×1 appresa ('jian'),
+    le concatena tornando al numero originale di canali,
+    e aggiunge una connessione residua alle caratteristiche correnti.
+    
+    Ufficiale: pan_out = cat([jian(corrente), jian(support)], dim=1) + corrente
+    Primo avvio: pan_out = cat([jian(corrente), jian(corrente)], dim=1) + corrente
+    """
     def __init__(self, c1):
         super().__init__()
-        # 1. Shared 1x1 Conv to reduce channels by half 
-        #    Input: c1 -> Output: c1 // 2
-        self.reduce = Conv(c1, c1 // 2, k=1) 
+        # 'jian' = 1×1 conv that halves channels (same conv applied to both streams)
+        self.jian = Conv(c1, c1 // 2, k=1)
 
-    def forward(self, x_curr, x_prev):
-        # Cold Start: duplicate current frame if history is missing [cite: 252]
-        if x_prev is None or x_curr.shape != x_prev.shape:
-            x_prev = x_curr
+    def forward(self, x_curr : torch.Tensor, x_support : torch.Tensor):
+        # Cold start: no support frame available → self-pair (matches official 'star' node)
+        if x_support is None or x_curr.shape != x_support.shape:
+            x_support = x_curr
 
-        # --- DYNAMIC FLOW ---
-        # A. Apply Shared Weight Reduction to BOTH frames separately
-        x_curr_red = self.reduce(x_curr)
-        x_prev_red = self.reduce(x_prev)
+        # Device/dtype safety
+        if x_support.device != x_curr.device:
+            x_support = x_support.to(x_curr.device)
+        if x_support.dtype != x_curr.dtype:
+            x_support = x_support.to(dtype=x_curr.dtype)
 
-        # B. Concatenate the reduced features 
-        #    (c1//2) + (c1//2) -> c1
-        x_dynamic = torch.cat([x_curr_red, x_prev_red], dim=1)
-
-        # --- STATIC FLOW  ---
-        # C. Residual Connection: Add original current feature to dynamic result
-        return x_dynamic + x_curr
+        # Official DFP fusion: cat halved features + residual
+        fused = torch.cat([self.jian(x_curr), self.jian(x_support)], dim=1)
+        return fused + x_curr
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):

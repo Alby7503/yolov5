@@ -214,15 +214,21 @@ def train(hyp, opt, device, callbacks):
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)
+        # 1. Load the file
         ckpt = torch_load(weights, map_location="cpu")
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+        if isinstance(ckpt, dict) and 'model' not in ckpt:
+            print(f"Loading clean weights from {weights}...")
+            csd = ckpt  # It is already the state_dict
+        else:
+            csd = ckpt['model'].float().state_dict()
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
-        csd = ckpt["model"].float().state_dict()
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
+
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
     
     amp = check_amp(model)  # check AMP
 
@@ -300,7 +306,7 @@ def train(hyp, opt, device, callbacks):
         image_weights=opt.image_weights,
         quad=opt.quad,
         prefix=colorstr("train: "),
-        shuffle=False,
+        shuffle=True,
         seed=opt.seed,
     )
     labels = np.concatenate(dataset.labels, 0)
@@ -387,10 +393,14 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, support_targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
+            # --- STREAMYOLO: During training, 6ch input contains both frames ---
+            # No cross-batch DFP buffer needed (both current + support are in the 6ch input).
+            # Reset buffer only for validation/inference (handled in model forward).
 
             # Warmup
             if ni <= nw:
@@ -414,7 +424,7 @@ def train(hyp, opt, device, callbacks):
             # Forward
             with torch.amp.autocast("cuda"):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                loss, loss_items = compute_loss(pred, targets.to(device), support_targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -457,12 +467,17 @@ def train(hyp, opt, device, callbacks):
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
+                # Reset DFP buffer before validation to avoid stale features
+                ema_model = ema.ema
+                if hasattr(ema_model, 'reset_buffer'):
+                    ema_model.reset_buffer()
+                
                 results, maps, _ = validate.run(
                     data_dict,
                     batch_size=batch_size // WORLD_SIZE * 2,
                     imgsz=imgsz,
                     half=amp,
-                    model=ema.ema,
+                    model=ema_model,
                     single_cls=single_cls,
                     dataloader=val_loader,
                     save_dir=save_dir,
@@ -643,13 +658,17 @@ def main(opt, callbacks=Callbacks()):
         last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
         opt_yaml = last.parent.parent / "opt.yaml"  # train options yaml
         opt_data = opt.data  # original dataset
+        opt_cfg = opt.cfg   # preserve --cfg from command line
         if opt_yaml.is_file():
             with open(opt_yaml, errors="ignore") as f:
                 d = yaml.safe_load(f)
         else:
             d = torch_load(last, map_location="cpu")["opt"]
         opt = argparse.Namespace(**d)  # replace
-        opt.cfg, opt.weights, opt.resume = "", str(last), True  # reinstate
+        opt.weights, opt.resume = str(last), True  # reinstate
+        # Restore cfg: prefer command-line --cfg, else keep what opt.yaml had
+        if opt_cfg:
+            opt.cfg = opt_cfg
         if is_url(opt_data):
             opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
     else:

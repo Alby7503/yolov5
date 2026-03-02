@@ -41,7 +41,7 @@ from models.common import (
     Conv,
     CrossConv,
     DetectMultiBackend,
-    DFP,    # StreamYOLO DFP Module
+    DFP,
     DWConv,
     DWConvTranspose2d,
     Expand,
@@ -202,17 +202,20 @@ class BaseModel(nn.Module):
         """Prints model information given verbosity and image size, e.g., `info(verbose=True, img_size=640)`."""
         model_info(self, verbose, img_size)
 
+    def reset_buffer(self):
+        """Reset history buffer for new video or validation start."""
+        if hasattr(self, 'prev_features'):
+            self.prev_features = [None] * len(self.dfp_modules)
+
     def _apply(self, fn):
-        """Applies transformations like to(), cpu(), cuda(), half() to model tensors excluding parameters or registered
-        buffers.
-        """
+        """Applies transformations like to(), cpu(), cuda(), half() to model tensors INCLUDING DFP buffers."""
         self = super()._apply(fn)
-        m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
-            m.stride = fn(m.stride)
-            m.grid = list(map(fn, m.grid))
-            if isinstance(m.anchor_grid, list):
-                m.anchor_grid = list(map(fn, m.anchor_grid))
+        # Move DFP feature buffers to the new device/dtype
+        if hasattr(self, 'prev_features'):
+            for i in range(len(self.prev_features)):
+                if self.prev_features[i] is not None:
+                    # fn is the transformation function (e.g., lambda t: t.cuda())
+                    self.prev_features[i] = fn(self.prev_features[i])
         return self
 
 
@@ -242,26 +245,25 @@ class DetectionModel(BaseModel):
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         
         # --- STREAMYOLO DFP INIT START ---
-        # 1. Identify Detect/Segment Head
-        # In YOLOv5, this is typically the last layer.
+        # Official StreamYOLO: DFP fuses PAN-level outputs from two independent backbone+FPN passes.
+        # 'jian' conv halves channels, cat restores them, residual add with current features.
         m = self.model[-1]
         
-        # Verify it is indeed a Detect or Segment head
         if isinstance(m, (Detect, Segment)):
             LOGGER.info(f"StreamYOLO: Initializing DFP for {type(m).__name__} head")
             
-            # 2. Initialize DFP modules
-            # We must match the input channels of the Detect head.
-            # m.m is the ModuleList of convolutions inside Detect.
-            # m.m[i] corresponds to the i-th input feature map.
+            # One DFP module per PAN output scale (matching Detect input channels)
             self.dfp_modules = nn.ModuleList()
             for i, conv in enumerate(m.m):
-                # The input channels of the head's conv is exactly the output channels of the FPN
                 c = conv.in_channels
                 self.dfp_modules.append(DFP(c))
             
-            # 3. Initialize Feature Buffer
+            # Buffer stores PAN-level features from the previous frame (for online inference)
             self.prev_features = [None] * len(self.dfp_modules)
+            
+            # Store which layer indices produce PAN outputs (Detect's input layers)
+            # m.f is e.g. [17, 20, 23] for yolov5s
+            self._pan_layer_indices = m.f if isinstance(m.f, list) else [m.f]
         else:
             LOGGER.warning("StreamYOLO: Could not find Detect/Segment head at model[-1]. DFP disabled.")
         # --- STREAMYOLO DFP INIT END ---
@@ -298,77 +300,88 @@ class DetectionModel(BaseModel):
 
     def _forward_once(self, x, profile=False, visualize=False, augment=False):
         """
-        Modified forward pass for StreamYOLO DFP injection.
-        Overrides BaseModel._forward_once to intercept Detect inputs.
+        Modified forward pass for StreamYOLO DFP injection (faithful to paper).
+        
+        Training (6ch input): splits into current+support, runs backbone+FPN for EACH
+        independently, then fuses PAN outputs with DFP jian layers before Detect.
+        
+        Inference (3ch, B=1): runs backbone+FPN once, fuses with buffered PAN outputs,
+        updates buffer for next frame.
         """
-        y, dt = [], []  # outputs
-        for m in self.model:
-            # 1. Standard connection logic
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+        has_dfp = hasattr(self, 'dfp_modules')
+        detect_layer = self.model[-1]
+        is_6ch = (x.shape[1] == 6)
+        
+        # --- CASE 1: Training with 6ch input (current + support concatenated) ---
+        if has_dfp and is_6ch and isinstance(detect_layer, (Detect, Segment)):
+            x_curr_img = x[:, :3, :, :]   # current frame
+            x_supp_img = x[:, 3:, :, :]   # support (previous) frame
             
+            # Run backbone+FPN for BOTH frames independently (excluding Detect head)
+            curr_pan_outs = self._run_backbone_fpn(x_curr_img, profile, visualize)
+            with torch.no_grad():
+                supp_pan_outs = self._run_backbone_fpn(x_supp_img, False, False)
+            
+            # Fuse PAN outputs with DFP: cat([jian(curr), jian(supp)], dim=1) + curr
+            x_fused = []
+            for i, (curr_feat, supp_feat) in enumerate(zip(curr_pan_outs, supp_pan_outs)):
+                x_fused.append(self.dfp_modules[i](curr_feat, supp_feat))
+            
+            # Run Detect head on fused features
+            return detect_layer(x_fused)
+        
+        # --- CASE 2: Inference (3ch, B=1) with buffer ---
+        elif has_dfp and not is_6ch and isinstance(detect_layer, (Detect, Segment)):
+            # Run backbone+FPN once for current frame
+            curr_pan_outs = self._run_backbone_fpn(x, profile, visualize)
+            
+            # Fuse with buffered PAN outputs (cold start = self-pair)
+            x_fused = []
+            for i, curr_feat in enumerate(curr_pan_outs):
+                support = self.prev_features[i]
+                x_fused.append(self.dfp_modules[i](curr_feat, support))
+            
+            # Update buffer with current PAN outputs
+            self.prev_features = [f.detach() for f in curr_pan_outs]
+            
+            # Run Detect head on fused features
+            return detect_layer(x_fused)
+        
+        # --- CASE 3: Fallback (no DFP, e.g. export or plain inference) ---
+        else:
+            y, dt = [], []
+            for m in self.model:
+                if m.f != -1:
+                    x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+                if profile:
+                    self._profile_one_layer(m, x, dt)
+                x = m(x)
+                y.append(x if m.i in self.save else None)
+                if visualize:
+                    feature_visualization(x, m.type, m.i, save_dir=visualize)
+            return x
+
+    def _run_backbone_fpn(self, x, profile=False, visualize=False):
+        """Run all layers EXCEPT the Detect head, return the PAN output features.
+        
+        Returns a list of tensors corresponding to each PAN output scale
+        (same as what Detect receives as input).
+        """
+        y, dt = [], []
+        for m in self.model[:-1]:  # all layers except Detect
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             if profile:
                 self._profile_one_layer(m, x, dt)
-            
-            # --- STREAMYOLO DFP INJECTION START ---
-            # Check if we are about to run the Detect/Segment head
-            
-            if hasattr(self, 'dfp_modules') and isinstance(m, (Detect, Segment)):
-                x_fused_list = []
-                for i, feat_curr in enumerate(x):
-                    # feat_curr shape: [Batch, Channels, Height, Width]
-                    
-                    # 1. Recuperiamo l'ultimo frame del BATCH PRECEDENTE (Buffer)
-                    #    Forma attesa: [1, C, H, W]
-                    last_frame_prev_batch = self.prev_features[i]
-                    
-                    # 2. Creiamo lo "storico" SHIFTANDO il batch corrente
-                    #    Prendiamo tutti i frame tranne l'ultimo: [0, 1, ..., B-2]
-                    #    Questi saranno il "passato" per i frame [1, 2, ..., B-1]0
-                    #    Forma: [B-1, C, H, W]
-                    
-                    if last_frame_prev_batch is not None:
-                        last_frame_prev_batch = last_frame_prev_batch.to(feat_curr.device)
-                    
-                    intra_batch_history = feat_curr[:-1]
-
-                    # 3. Assembliamo il tensore feat_prev completo
-                    if last_frame_prev_batch is None or last_frame_prev_batch.shape[1:] != feat_curr.shape[1:]:
-                        # COLD START (Primo Batch o cambio risoluzione):
-                        # Il Frame 0 usa se stesso come passato.
-                        # I Frame 1..N usano i frame 0..N-1.
-                        feat_prev = torch.cat([feat_curr[0:1], intra_batch_history], dim=0)
-                    else:
-                        # REGIME NORMALE:
-                        # Il Frame 0 usa l'ultimo del batch scorso.
-                        # I Frame 1..N usano i frame 0..N-1.
-                        feat_prev = torch.cat([last_frame_prev_batch, intra_batch_history], dim=0)
-                    
-                    # 4. Aggiorniamo il Buffer per il PROSSIMO batch
-                    #    Salviamo SOLO l'ultimo frame del batch corrente.
-                    #    Lo stacchiamo dal grafo per non propagare gradienti infiniti nel tempo.
-                    if not augment:
-                        self.prev_features[i] = feat_curr[-1:].detach() # Salva slice [1, C, H, W]
-
-                    # 5. Applichiamo il DFP
-                    #    Ora feat_prev è perfettamente allineato (lag = 1 frame)
-                    feat_fused = self.dfp_modules[i](feat_curr, feat_prev)
-                    x_fused_list.append(feat_fused)
-                
-                # Replace input x with fused list
-                x = x_fused_list
-            # --- STREAMYOLO DFP INJECTION END ---
-
-            # 2. Run the layer
             x = m(x)
-
-            # 3. Save output
             y.append(x if m.i in self.save else None)
-            
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
-                
-        return x
+        
+        # Collect PAN outputs (the features that feed into Detect)
+        pan_indices = self._pan_layer_indices
+        pan_outs = [y[idx] for idx in pan_indices]
+        return pan_outs
 
     def _forward_augment(self, x):
         """Performs augmented inference across different scales and flips, returning combined detections."""
@@ -376,13 +389,19 @@ class DetectionModel(BaseModel):
         s = [1, 0.83, 0.67]  # scales
         f = [None, 3, None]  # flips (2-ud, 3-lr)
         y = []  # outputs
+        
+        # Save DFP buffer so augmented passes don't corrupt it
+        saved_buffer = list(self.prev_features) if hasattr(self, 'prev_features') else None
+        
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
             
-            # Pass augment=True to prevent buffer corruption
-            yi = self._forward_once(xi, augment=True)[0]  # forward
+            yi = self._forward_once(xi)[0]  # forward
             
-            # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
+            # Restore buffer after each augmented pass
+            if saved_buffer is not None:
+                self.prev_features = list(saved_buffer)
+            
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
